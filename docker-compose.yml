@@ -1,0 +1,34 @@
+version: "3.9"
+
+services:
+  bot:
+    build: .
+    container_name: trading_bot
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ./data:/app/data        # portfolio.json persists here
+    command: python bot.py --loop --interval 15
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  dashboard:
+    build: .
+    container_name: trading_dashboard
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/app/data
+    command: uvicorn dashboard.server:app --host 0.0.0.0 --port 8000
+    depends_on:
+      - bot
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "5m"
+        max-file: "3"

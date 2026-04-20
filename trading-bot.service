@@ -1,0 +1,23 @@
+[Unit]
+Description=Trading Bot (Replicate-powered)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=botuser
+WorkingDirectory=/home/botuser/paper_trader
+EnvironmentFile=/home/botuser/paper_trader/.env
+ExecStart=/home/botuser/paper_trader/venv/bin/python bot.py --loop --interval 15
+Restart=on-failure
+RestartSec=30
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=trading-bot
+
+# Resource limits
+MemoryMax=512M
+CPUQuota=50%
+
+[Install]
+WantedBy=multi-user.target
