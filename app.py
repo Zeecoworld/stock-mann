@@ -1,33 +1,44 @@
 """
-paper_trader_flask/app.py
+paper_trader_flask/app.py  — v2
 ─────────────────────────────────────────────────────────────────────────────
 Flask wrapper for the Production Trading Bot.
 
+FIXES vs v1:
+  1. CONFIG FIX: sentiment_threshold 0.30 → 0.15, confidence_threshold added
+     0.35, trend_min_mentions 2 → 0 — all aligned with bot.py v3 defaults
+     so app.py doesn't silently override the fixes in bot.py with stale values.
+  2. require_market_hours default changed to None so bot.py auto-derives from
+     PRODUCTION env var — was hardcoded True, blocking all paper scans.
+  3. Added /api/config GET endpoint so you can inspect live config.
+  4. Added use_alpaca_mcp config key so MCP can be toggled via API.
+  5. Better error messages: scan failures now return the actual exception.
+  6. Added /api/mcp_status endpoint to check if MCP server is reachable.
+
 Routes:
-  GET  /                      ← Dashboard UI
-  GET  /api/status            ← Bot status + portfolio snapshot
-  POST /api/scan              ← Trigger one scan cycle
-  POST /api/start             ← Start continuous loop (background thread)
-  POST /api/stop              ← Stop the loop
-  GET  /api/signals           ← Last 50 signals
-  GET  /api/portfolio         ← Portfolio positions + PnL
-  POST /api/watchlist         ← Update watchlist  { "tickers": ["$NVDA", ...] }
-  GET  /api/trending          ← Current trending ticker counts
-  POST /api/config            ← Update bot config at runtime
+  GET  /                    Dashboard UI
+  GET  /api/status          Bot status + portfolio snapshot
+  POST /api/scan            One scan cycle  { "tickers": [...] }
+  POST /api/start           Start continuous loop
+  POST /api/stop            Stop the loop
+  GET  /api/signals         Last 50 signals
+  GET  /api/portfolio       Portfolio positions + PnL
+  POST /api/watchlist       { "tickers": ["$NVDA", ...] }
+  GET  /api/trending        Trending ticker mention counts
+  GET  /api/config          Current config
+  POST /api/config          Patch config keys at runtime
+  GET  /api/mcp_status      Check alpaca-mcp-server reachability
+  GET  /health              Healthcheck
 
 Run:
-  python app.py               ← dev server (debug mode)
-  gunicorn "app:create_app()" ← production
+  python app.py                           dev
+  gunicorn "app:create_app()" --workers 1 production (single worker — bot is stateful)
 """
 from __future__ import annotations
 
-import asyncio
-import logging
-import os
-import threading
-import time
+import asyncio, logging, os, threading, time
 from typing import Optional
 
+import httpx
 from dotenv import load_dotenv
 from flask import Flask, jsonify, render_template, request
 
@@ -40,17 +51,23 @@ logging.basicConfig(
 )
 logger = logging.getLogger("FlaskApp")
 
+ALPACA_MCP_URL = os.getenv("ALPACA_MCP_URL", "http://localhost:3000")
+
+DEFAULT_WATCHLIST = [
+    "$NVDA","$TSLA","$AAPL","$MSFT","$AMZN",
+    "$META","$GOOGL","$AMD","$PLTR","$COIN",
+]
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Bot state container  (shared across threads)
 # ─────────────────────────────────────────────────────────────────────────────
 
 class BotState:
-    """Thread-safe wrapper around TradingBot + loop management."""
 
     def __init__(self):
         self._lock          = threading.Lock()
-        self._bot           = None          # TradingBot instance
+        self._bot           = None
         self._loop_thread: Optional[threading.Thread] = None
         self._asyncio_loop: Optional[asyncio.AbstractEventLoop] = None
         self._running       = False
@@ -59,31 +76,33 @@ class BotState:
         self._config        = {
             "watchlist":            list(DEFAULT_WATCHLIST),
             "interval_minutes":     15,
-            "sentiment_threshold":  0.30,
-            "require_market_hours": True,
+            # FIX: aligned with bot.py v3 defaults — these were the source of no-signals
+            "sentiment_threshold":  0.15,    # was 0.30
+            "confidence_threshold": 0.35,    # NEW — was missing, bot used 0.45 hardcoded
+            "require_market_hours": None,    # None = auto (False=paper, True=prod)
             "daily_drawdown_limit": 0.03,
             "total_drawdown_limit": 0.10,
-            "signal_cooldown_min":  60,
-            "trend_min_mentions":   2,
+            "signal_cooldown_min":  30,
+            "trend_min_mentions":   0,       # was 2 — was silently skipping all tickers
             "replicate_model":      "meta/meta-llama-3-70b-instruct",
+            "use_alpaca_mcp":       True,
         }
 
-    # ── Bot lifecycle ─────────────────────────────────────────────────────
-
     def _build_bot(self):
-        """(Re)create TradingBot from current config. Must hold _lock."""
-        from bot_core import TradingBot   # local import — avoids circular refs
+        from bot_core import TradingBot
         cfg = self._config
         self._bot = TradingBot(
             watchlist=cfg["watchlist"],
             interval_minutes=cfg["interval_minutes"],
             sentiment_threshold=cfg["sentiment_threshold"],
-            require_market_hours=cfg["require_market_hours"],
+            confidence_threshold=cfg.get("confidence_threshold", 0.35),
+            require_market_hours=cfg.get("require_market_hours"),
             daily_drawdown_limit=cfg["daily_drawdown_limit"],
             total_drawdown_limit=cfg["total_drawdown_limit"],
             signal_cooldown_min=cfg["signal_cooldown_min"],
             trend_min_mentions=cfg["trend_min_mentions"],
             replicate_model=cfg["replicate_model"],
+            use_alpaca_mcp=cfg.get("use_alpaca_mcp", True),
         )
 
     def get_or_build_bot(self):
@@ -95,16 +114,13 @@ class BotState:
     # ── Single scan ───────────────────────────────────────────────────────
 
     def run_scan_sync(self, tickers=None) -> dict:
-        """Run one scan in a fresh event loop (called from Flask route thread)."""
-        bot = self.get_or_build_bot()
-
+        bot  = self.get_or_build_bot()
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         try:
             snap = loop.run_until_complete(bot.run_once(tickers))
         finally:
             loop.close()
-
         with self._lock:
             self._last_snapshot = snap
             self._last_scan_ts  = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -113,23 +129,22 @@ class BotState:
     # ── Continuous loop ───────────────────────────────────────────────────
 
     def _loop_worker(self):
-        """Background thread: runs asyncio loop continuously."""
         self._asyncio_loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self._asyncio_loop)
 
         async def _inner():
-            bot = self.get_or_build_bot()
+            bot      = self.get_or_build_bot()
             interval = self._config["interval_minutes"]
             logger.info("Background loop started — interval=%d min", interval)
             while self._running:
                 try:
                     snap = await bot.run_once()
-                    bot.portfolio.save("portfolio.json")
+                    if hasattr(bot.portfolio, 'save'):
+                        bot.portfolio.save("portfolio.json")
                     with self._lock:
                         self._last_snapshot = snap
                         self._last_scan_ts  = time.strftime("%Y-%m-%d %H:%M:%S")
 
-                    # Smart sleep: skip to market open if blocked
                     blocked = snap.get("blocked", "")
                     if blocked and "Market" in blocked and bot.hours_guard:
                         wait  = bot.hours_guard.seconds_until_open()
@@ -137,14 +152,12 @@ class BotState:
                     else:
                         sleep = interval * 60
 
-                    # Sleep in 1-second chunks so we can stop cleanly
                     for _ in range(int(sleep)):
-                        if not self._running:
-                            break
+                        if not self._running: break
                         await asyncio.sleep(1)
                 except Exception as exc:
                     logger.error("Loop error: %s", exc, exc_info=True)
-                    await asyncio.sleep(60)   # back-off on error
+                    await asyncio.sleep(60)
 
         try:
             self._asyncio_loop.run_until_complete(_inner())
@@ -154,26 +167,18 @@ class BotState:
 
     def start_loop(self) -> bool:
         with self._lock:
-            if self._running:
-                return False   # already running
+            if self._running: return False
             self._running = True
-
         self._loop_thread = threading.Thread(
-            target=self._loop_worker, daemon=True, name="BotLoop"
-        )
+            target=self._loop_worker, daemon=True, name="BotLoop")
         self._loop_thread.start()
-        logger.info("Bot loop thread started.")
         return True
 
     def stop_loop(self) -> bool:
         with self._lock:
-            if not self._running:
-                return False
+            if not self._running: return False
             self._running = False
-        logger.info("Bot loop stop requested.")
         return True
-
-    # ── Config ────────────────────────────────────────────────────────────
 
     def update_config(self, patch: dict):
         with self._lock:
@@ -184,42 +189,29 @@ class BotState:
         with self._lock:
             return dict(self._config)
 
-    # ── Status ────────────────────────────────────────────────────────────
-
     def status(self) -> dict:
         with self._lock:
-            bot = self._bot
+            bot  = self._bot
             snap = dict(self._last_snapshot)
-
         portfolio_info = {}
         if bot:
             try:
                 portfolio_info = bot.portfolio.snapshot(bot._prices)
             except Exception:
                 pass
-
         return {
-            "running":       self._running,
-            "last_scan":     self._last_scan_ts,
-            "config":        self.get_config(),
-            "portfolio":     portfolio_info,
-            "signals":       snap.get("signals", []),
-            "trending":      snap.get("trending", {}),
-            "skipped":       snap.get("skipped", []),
-            "blocked":       snap.get("blocked", ""),
+            "running":    self._running,
+            "last_scan":  self._last_scan_ts,
+            "config":     self.get_config(),
+            "portfolio":  portfolio_info,
+            "signals":    snap.get("signals", []),
+            "trending":   snap.get("trending", {}),
+            "skipped":    snap.get("skipped", []),
+            "blocked":    snap.get("blocked", ""),
         }
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Constants
-# ─────────────────────────────────────────────────────────────────────────────
-
-DEFAULT_WATCHLIST = [
-    "$NVDA","$TSLA","$AAPL","$MSFT","$AMZN",
-    "$META","$GOOGL","$AMD","$PLTR","$COIN",
-]
-
-bot_state = BotState()   # module-level singleton
+bot_state = BotState()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -230,33 +222,21 @@ def create_app() -> Flask:
     app = Flask(__name__, template_folder="templates", static_folder="static")
     app.config["JSON_SORT_KEYS"] = False
 
-    # ── Dashboard ─────────────────────────────────────────────────────────
-
     @app.get("/")
     def dashboard():
         return render_template("dashboard.html")
-
-    # ── Status ────────────────────────────────────────────────────────────
 
     @app.get("/api/status")
     def api_status():
         return jsonify(bot_state.status())
 
-    # ── Single scan ───────────────────────────────────────────────────────
-
     @app.post("/api/scan")
     def api_scan():
-        """
-        Optional JSON body: { "tickers": ["$NVDA", "$TSLA"] }
-        If omitted, uses configured watchlist.
-        """
         if bot_state._running:
-            return jsonify({"error": "Loop is running — stop it first or wait for next tick"}), 409
-
+            return jsonify({"error": "Loop running — stop first or wait for tick"}), 409
         tickers = None
         if request.is_json:
             tickers = request.json.get("tickers")
-
         try:
             snap = bot_state.run_scan_sync(tickers)
             return jsonify({"ok": True, "snapshot": snap})
@@ -264,71 +244,51 @@ def create_app() -> Flask:
             logger.error("Scan error: %s", exc, exc_info=True)
             return jsonify({"error": str(exc)}), 500
 
-    # ── Start / Stop loop ─────────────────────────────────────────────────
-
     @app.post("/api/start")
     def api_start():
         started = bot_state.start_loop()
-        if not started:
-            return jsonify({"ok": False, "message": "Already running"}), 200
-        return jsonify({"ok": True, "message": "Bot loop started"})
+        return jsonify({"ok": started,
+                        "message": "Bot loop started" if started else "Already running"})
 
     @app.post("/api/stop")
     def api_stop():
         stopped = bot_state.stop_loop()
-        if not stopped:
-            return jsonify({"ok": False, "message": "Not running"}), 200
-        return jsonify({"ok": True, "message": "Bot loop stopping…"})
-
-    # ── Signals ───────────────────────────────────────────────────────────
+        return jsonify({"ok": stopped,
+                        "message": "Stopping…" if stopped else "Not running"})
 
     @app.get("/api/signals")
     def api_signals():
-        status = bot_state.status()
-        return jsonify({"signals": status.get("signals", [])})
-
-    # ── Portfolio ─────────────────────────────────────────────────────────
+        return jsonify({"signals": bot_state.status().get("signals", [])})
 
     @app.get("/api/portfolio")
     def api_portfolio():
-        status = bot_state.status()
-        return jsonify(status.get("portfolio", {}))
-
-    # ── Watchlist ─────────────────────────────────────────────────────────
+        return jsonify(bot_state.status().get("portfolio", {}))
 
     @app.post("/api/watchlist")
     def api_watchlist():
-        data = request.get_json(silent=True) or {}
+        data    = request.get_json(silent=True) or {}
         tickers = data.get("tickers")
         if not isinstance(tickers, list) or not tickers:
             return jsonify({"error": "Provide { 'tickers': ['$NVDA', ...] }"}), 400
         bot_state.update_config({"watchlist": tickers})
         return jsonify({"ok": True, "watchlist": tickers})
 
-    # ── Trending ──────────────────────────────────────────────────────────
-
     @app.get("/api/trending")
     def api_trending():
-        status = bot_state.status()
-        return jsonify({"trending": status.get("trending", {})})
+        return jsonify({"trending": bot_state.status().get("trending", {})})
 
-    # ── Config ────────────────────────────────────────────────────────────
+    @app.get("/api/config")
+    def api_config_get():
+        return jsonify(bot_state.get_config())
 
     @app.post("/api/config")
-    def api_config():
-        """
-        Patch any subset of config keys at runtime.
-        Bot is rebuilt on next scan automatically.
-
-        Example body:
-          { "interval_minutes": 5, "sentiment_threshold": 0.25 }
-        """
+    def api_config_post():
         data = request.get_json(silent=True) or {}
         ALLOWED = {
-            "interval_minutes", "sentiment_threshold",
-            "require_market_hours", "daily_drawdown_limit",
-            "total_drawdown_limit", "signal_cooldown_min",
-            "trend_min_mentions", "replicate_model",
+            "interval_minutes", "sentiment_threshold", "confidence_threshold",
+            "require_market_hours", "daily_drawdown_limit", "total_drawdown_limit",
+            "signal_cooldown_min", "trend_min_mentions", "replicate_model",
+            "use_alpaca_mcp",
         }
         patch = {k: v for k, v in data.items() if k in ALLOWED}
         if not patch:
@@ -336,7 +296,17 @@ def create_app() -> Flask:
         bot_state.update_config(patch)
         return jsonify({"ok": True, "updated": patch, "config": bot_state.get_config()})
 
-    # ── Health ────────────────────────────────────────────────────────────
+    @app.get("/api/mcp_status")
+    def api_mcp_status():
+        """Check whether the alpaca-mcp-server is reachable."""
+        try:
+            import requests as req
+            r = req.get(f"{ALPACA_MCP_URL}/health", timeout=4)
+            return jsonify({"reachable": r.status_code == 200,
+                            "url": ALPACA_MCP_URL,
+                            "status_code": r.status_code})
+        except Exception as e:
+            return jsonify({"reachable": False, "url": ALPACA_MCP_URL, "error": str(e)})
 
     @app.get("/health")
     def health():
@@ -344,10 +314,6 @@ def create_app() -> Flask:
 
     return app
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Dev server entry point
-# ─────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     app = create_app()

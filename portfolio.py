@@ -128,14 +128,9 @@ class PaperPortfolio:
     # ── Order sizing ──────────────────────────────────────────────────────
 
     def _size_order(self, price: float, confidence: float) -> float:
-        """
-        FIX: Kelly-adjacent sizing with hard floor.
-        Was generating <1 share orders on $10k portfolio at 2% risk.
-        """
         portfolio_value = self.cash + sum(p.cost_basis for p in self.positions.values())
         target_dollars  = portfolio_value * self.risk_per_trade * min(confidence, 1.0)
 
-        # FIX: enforce minimum order size
         target_dollars  = max(target_dollars, self.min_order_size)
 
         # Don't exceed available cash (95% of cash to leave buffer)
@@ -147,10 +142,8 @@ class PaperPortfolio:
                     target_dollars, actual_dollars, shares, price)
         return round(shares, 4)
 
-    # ── Trade execution ───────────────────────────────────────────────────
 
     def execute_buy(self, ticker, price, confidence, reasoning, source="stock"):
-        # FIX: verbose failure reasons instead of silent None
         if len(self.positions) >= self.max_positions:
             logger.warning("[Portfolio] BUY FAILED %s — max positions (%d) reached",
                            ticker, self.max_positions)
@@ -241,7 +234,6 @@ class PaperPortfolio:
                     closed.append(r)
         return closed
 
-    # ── Snapshot ──────────────────────────────────────────────────────────
 
     def snapshot(self, prices: Dict[str, float] = None) -> dict:
         prices = prices or {}

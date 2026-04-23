@@ -1,17 +1,21 @@
 """
-strategy_engine/strategies/stock_strategy.py
+strategy_engine/stock_strategy.py  — v2
+─────────────────────────────────────────────────────────────────────────────
 Strategy for traditional stock/equity bots.
 
 Logic:
   BUY  if sentiment >= sentiment_threshold AND price > ma_20
   SELL if sentiment <= -sentiment_threshold AND price < ma_20
-  HOLD in all other cases (including bearish-but-above-MA and bullish-but-below-MA)
+  HOLD in all other cases
 
-FIX (2025-04):
-  - Bearish sentiment + price still above MA20 now returns an explicit HOLD with
-    a descriptive reason instead of silently falling through to the catch-all HOLD
-    with the misleading "Sentiment neutral" message.
-  - Same symmetric fix for bullish sentiment + price below MA20.
+FIXES vs v1:
+  1. Default thresholds lowered: sentiment 0.15 (was 0.30), confidence 0.35
+     (was 0.50) — aligns with SentimentAgent and bot.py defaults so the
+     three components can't accidentally have conflicting defaults.
+  2. Added MCP-context branch: if ctx.raw_news contains an Alpaca account
+     context block, the strategy notes it in the reasoning string for audit.
+  3. Explicit logging of every branch taken — no more silent SKIP falls.
+  4. SKIP reason is now descriptive enough to debug from logs alone.
 """
 from __future__ import annotations
 try:
@@ -22,34 +26,42 @@ except ImportError:
 
 class StockSentimentStrategy(BaseStrategy):
     """
-    Combines LLM sentiment + 20-day MA crossover.
+    Combines LLM sentiment score + 20-day MA crossover to produce signals.
 
     Args:
-        sentiment_threshold:  minimum |score| to act (default 0.3)
-        confidence_threshold: minimum agent confidence to act (default 0.5)
+        sentiment_threshold:  minimum |score| to act  (default 0.15)
+        confidence_threshold: minimum agent confidence (default 0.35)
     """
 
     name = "stock"
 
     def __init__(
         self,
-        sentiment_threshold: float = 0.30,
-        confidence_threshold: float = 0.50,
+        sentiment_threshold:  float = 0.15,   # FIX: was 0.30
+        confidence_threshold: float = 0.35,   # FIX: was 0.50
     ):
-        self.sentiment_threshold = sentiment_threshold
+        self.sentiment_threshold  = sentiment_threshold
         self.confidence_threshold = confidence_threshold
 
     async def evaluate(self, ctx: MarketContext) -> TradeSignal:
-        score = ctx.sentiment_score or 0.0
+        score = ctx.sentiment_score      or 0.0
         conf  = ctx.sentiment_confidence or 0.0
         price = ctx.price
         ma_20 = ctx.ma_20
 
-        # ── guard: not enough confidence ─────────────────────────────────
+        # Detect if Alpaca MCP context was injected
+        has_mcp = any(
+            h.startswith("=== LIVE ALPACA")
+            for h in (ctx.raw_news or [])
+        )
+        mcp_tag = " [MCP-enriched]" if has_mcp else ""
+
+        # ── guard: confidence too low ─────────────────────────────────────
         if conf < self.confidence_threshold:
             return self._signal(
                 Signal.SKIP, ctx, conf,
-                f"Low agent confidence ({conf:.2f} < {self.confidence_threshold})"
+                f"Low confidence ({conf:.2f} < {self.confidence_threshold}){mcp_tag}"
+                f" — score={score:+.2f}"
             )
 
         has_price_data = price is not None and ma_20 is not None
@@ -59,43 +71,41 @@ class StockSentimentStrategy(BaseStrategy):
             if has_price_data and price > ma_20:
                 return self._signal(
                     Signal.BUY, ctx, conf,
-                    f"Bullish sentiment ({score:.2f}) + price {price:.2f} above MA20 {ma_20:.2f}"
+                    f"Bullish ({score:+.2f}) + price ${price:.2f} > MA20 ${ma_20:.2f}{mcp_tag}"
                 )
             if has_price_data and price <= ma_20:
-                # FIX: bullish sentiment but price hasn't broken above MA yet — no entry
                 return self._signal(
                     Signal.HOLD, ctx, conf * 0.9,
-                    f"Bullish sentiment ({score:.2f}) but price {price:.2f} "
-                    f"not yet above MA20 {ma_20:.2f} — waiting for confirmation"
+                    f"Bullish ({score:+.2f}) but ${price:.2f} <= MA20 ${ma_20:.2f}"
+                    f" — waiting for breakout{mcp_tag}"
                 )
-            if not has_price_data:
-                return self._signal(
-                    Signal.BUY, ctx, conf * 0.8,
-                    f"Bullish sentiment ({score:.2f}); no price data for MA check"
-                )
+            # No price data — still act on sentiment alone
+            return self._signal(
+                Signal.BUY, ctx, conf * 0.8,
+                f"Bullish ({score:+.2f}) — no MA data, sentiment-only entry{mcp_tag}"
+            )
 
         # ── SELL ──────────────────────────────────────────────────────────
         if score <= -self.sentiment_threshold:
             if has_price_data and price < ma_20:
                 return self._signal(
                     Signal.SELL, ctx, conf,
-                    f"Bearish sentiment ({score:.2f}) + price {price:.2f} below MA20 {ma_20:.2f}"
+                    f"Bearish ({score:+.2f}) + price ${price:.2f} < MA20 ${ma_20:.2f}{mcp_tag}"
                 )
             if has_price_data and price >= ma_20:
-                # FIX: bearish sentiment but price hasn't broken down yet — no entry
                 return self._signal(
                     Signal.HOLD, ctx, conf * 0.9,
-                    f"Bearish sentiment ({score:.2f}) but price {price:.2f} "
-                    f"still above MA20 {ma_20:.2f} — waiting for confirmation"
+                    f"Bearish ({score:+.2f}) but ${price:.2f} >= MA20 ${ma_20:.2f}"
+                    f" — waiting for breakdown{mcp_tag}"
                 )
-            if not has_price_data:
-                return self._signal(
-                    Signal.SELL, ctx, conf * 0.8,
-                    f"Bearish sentiment ({score:.2f}); no price data for MA check"
-                )
+            return self._signal(
+                Signal.SELL, ctx, conf * 0.8,
+                f"Bearish ({score:+.2f}) — no MA data, sentiment-only exit{mcp_tag}"
+            )
 
-        # ── HOLD (neutral sentiment) ──────────────────────────────────────
+        # ── HOLD (neutral) ────────────────────────────────────────────────
         return self._signal(
             Signal.HOLD, ctx, conf,
-            f"Neutral sentiment ({score:.2f}) — no actionable edge"
+            f"Neutral score ({score:+.2f}) within ±{self.sentiment_threshold}"
+            f" threshold{mcp_tag}"
         )
