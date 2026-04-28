@@ -113,6 +113,52 @@
   }
   .divider { border: none; border-top: 1px solid var(--border); margin: 16px 0; }
 
+  /* ALPACA STATUS */
+  .alpaca-status {
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 10px 12px;
+    margin-bottom: 16px;
+    font-size: 11px;
+  }
+  .alpaca-status-header {
+    display: flex; align-items: center; justify-content: space-between;
+    margin-bottom: 6px;
+  }
+  .alpaca-status-title {
+    font-size: 10px; letter-spacing: .1em; text-transform: uppercase;
+    color: var(--text-dim); font-weight: 700;
+  }
+  .alpaca-badge {
+    display: inline-flex; align-items: center; gap: 5px;
+    padding: 2px 8px; border-radius: 999px; font-size: 10px;
+    font-weight: 700; letter-spacing: .06em; text-transform: uppercase;
+    border: 1px solid; transition: all .3s;
+  }
+  .alpaca-badge.connected    { color: var(--green);  border-color: var(--green);  background: rgba(0,232,122,.08); }
+  .alpaca-badge.disconnected { color: var(--red);    border-color: var(--red);    background: rgba(255,59,92,.08); }
+  .alpaca-badge.internal     { color: var(--yellow); border-color: var(--yellow); background: rgba(255,212,71,.08); }
+  .alpaca-badge.checking     { color: var(--muted);  border-color: var(--border); }
+  .alpaca-dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; flex-shrink: 0; }
+  .alpaca-row {
+    display: flex; justify-content: space-between;
+    padding: 3px 0; border-bottom: 1px solid var(--border); color: var(--text-dim);
+  }
+  .alpaca-row:last-child { border-bottom: none; }
+  .alpaca-row-val { color: var(--text); font-weight: 700; }
+  .alpaca-row-val.green { color: var(--green); }
+  .alpaca-row-val.red   { color: var(--red); }
+  .alpaca-error {
+    color: var(--red); font-size: 10px; line-height: 1.5;
+    margin-top: 4px; word-break: break-word;
+  }
+  .alpaca-recheck {
+    background: none; border: none; color: var(--text-dim);
+    cursor: pointer; font-size: 11px; padding: 0;
+    font-family: var(--font-mono); transition: color .15s;
+  }
+  .alpaca-recheck:hover { color: var(--blue); }
+
   /* PORTFOLIO STATS */
   .stat-grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; margin-bottom: 18px; }
   .stat-label { color: var(--text-dim); font-size: 10px; margin-bottom: 3px; }
@@ -317,6 +363,29 @@
 
   <!-- LEFT: Controls -->
   <div class="panel left-panel tab-active" id="tab-left">
+
+    <!-- ALPACA CONNECTION STATUS -->
+    <div class="alpaca-status" id="alpacaStatusBox">
+      <div class="alpaca-status-header">
+        <span class="alpaca-status-title">Alpaca API</span>
+        <div style="display:flex;align-items:center;gap:8px;">
+          <button class="alpaca-recheck" onclick="checkAlpaca()" title="Re-check connection">↺</button>
+          <span class="alpaca-badge checking" id="alpacaBadge">
+            <span class="alpaca-dot"></span>
+            <span id="alpacaBadgeText">Checking…</span>
+          </span>
+        </div>
+      </div>
+      <div id="alpacaDetails">
+        <div class="alpaca-row"><span>Mode</span><span class="alpaca-row-val" id="alpacaMode">—</span></div>
+        <div class="alpaca-row"><span>Cash</span><span class="alpaca-row-val green" id="alpacaCash">—</span></div>
+        <div class="alpaca-row"><span>Equity</span><span class="alpaca-row-val" id="alpacaEquity">—</span></div>
+        <div class="alpaca-row"><span>Buying power</span><span class="alpaca-row-val" id="alpacaBP">—</span></div>
+        <div class="alpaca-row"><span>Acct status</span><span class="alpaca-row-val" id="alpacaAcctStatus">—</span></div>
+      </div>
+      <div class="alpaca-error" id="alpacaError" style="display:none;"></div>
+    </div>
+
     <div class="panel-title">Portfolio</div>
     <div class="stat-grid">
       <div><div class="stat-label">Cash</div><div class="stat-value" id="cash">$—</div></div>
@@ -524,10 +593,58 @@ function render(data) {
       }).join('');
 }
 
+// Alpaca connection check
+async function checkAlpaca() {
+  const badge    = document.getElementById('alpacaBadge');
+  const badgeTxt = document.getElementById('alpacaBadgeText');
+  const errEl    = document.getElementById('alpacaError');
+  badgeTxt.textContent = 'Checking…';
+  badge.className = 'alpaca-badge checking';
+  errEl.style.display = 'none';
+
+  const r = await api('GET', '/api/alpaca_status');
+  if (!r || r.error === undefined && r.connected === undefined) {
+    badgeTxt.textContent = 'Unreachable';
+    badge.className = 'alpaca-badge disconnected';
+    return;
+  }
+
+  if (r.connected) {
+    badge.className = 'alpaca-badge connected';
+    badgeTxt.textContent = r.mode === 'paper' ? 'Paper ✓' : 'Live ✓';
+    const acct = r.account || {};
+    const fmt2 = v => v != null ? '$' + parseFloat(v).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2}) : '—';
+    document.getElementById('alpacaMode').textContent        = r.mode === 'paper' ? 'Paper trading' : '🔴 LIVE trading';
+    document.getElementById('alpacaCash').textContent        = fmt2(acct.cash);
+    document.getElementById('alpacaEquity').textContent      = fmt2(acct.equity);
+    document.getElementById('alpacaBP').textContent          = fmt2(acct.buying_power);
+    const statusEl = document.getElementById('alpacaAcctStatus');
+    statusEl.textContent = acct.status || '—';
+    statusEl.className   = 'alpaca-row-val ' + (acct.status === 'ACTIVE' ? 'green' : 'red');
+    errEl.style.display  = 'none';
+  } else {
+    badge.className      = r.mode === 'internal' ? 'alpaca-badge internal' : 'alpaca-badge disconnected';
+    badgeTxt.textContent = r.mode === 'internal' ? 'Not connected' : 'Error';
+    document.getElementById('alpacaMode').textContent       = r.mode === 'internal' ? 'Internal paper' : r.mode || '—';
+    document.getElementById('alpacaCash').textContent       = '—';
+    document.getElementById('alpacaEquity').textContent     = '—';
+    document.getElementById('alpacaBP').textContent         = '—';
+    document.getElementById('alpacaAcctStatus').textContent = '—';
+    document.getElementById('alpacaAcctStatus').className   = 'alpaca-row-val';
+    errEl.textContent    = r.error || 'Unknown error';
+    errEl.style.display  = 'block';
+  }
+}
+
 // Polling
 let pollTimer = null;
 async function poll() { render(await api('GET', '/api/status')); }
-function startPoll() { clearInterval(pollTimer); poll(); pollTimer = setInterval(poll, 5000); }
+function startPoll() {
+  clearInterval(pollTimer);
+  poll();
+  checkAlpaca();   // check Alpaca on every start
+  pollTimer = setInterval(poll, 5000);
+}
 startPoll();
 </script>
 </body>

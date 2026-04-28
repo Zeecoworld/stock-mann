@@ -296,6 +296,66 @@ def create_app() -> Flask:
         bot_state.update_config(patch)
         return jsonify({"ok": True, "updated": patch, "config": bot_state.get_config()})
 
+    @app.get("/api/alpaca_status")
+    def api_alpaca_status():
+        """
+        Check Alpaca API connectivity and return account details.
+        Tries to connect using current env vars and returns:
+          - connected: bool
+          - mode: "paper" | "live" | "internal"
+          - account: { cash, equity, buying_power, status } or {}
+          - error: str (only if not connected)
+        """
+        key    = os.getenv("ALPACA_API_KEY", "")
+        secret = os.getenv("ALPACA_SECRET_KEY", "")
+        base   = os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
+        use_alpaca = os.getenv("USE_ALPACA_PAPER", "false").lower() == "true" \
+                     or os.getenv("PRODUCTION", "false").lower() == "true"
+
+        if not key or not secret:
+            return jsonify({
+                "connected": False,
+                "mode": "internal",
+                "account": {},
+                "error": "ALPACA_API_KEY or ALPACA_SECRET_KEY not set in environment"
+            })
+
+        if not use_alpaca:
+            return jsonify({
+                "connected": False,
+                "mode": "internal",
+                "account": {},
+                "error": "USE_ALPACA_PAPER=false — bot is using internal paper portfolio, not Alpaca"
+            })
+
+        is_paper = "paper-api" in base
+        mode = "paper" if is_paper else "live"
+
+        try:
+            from alpaca.trading.client import TradingClient
+            client = TradingClient(key, secret, paper=is_paper)
+            acct   = client.get_account()
+            return jsonify({
+                "connected":  True,
+                "mode":       mode,
+                "url":        base,
+                "account": {
+                    "cash":          str(acct.cash),
+                    "equity":        str(acct.equity),
+                    "buying_power":  str(acct.buying_power),
+                    "status":        str(acct.status),
+                    "currency":      str(acct.currency),
+                    "pattern_day_trader": bool(acct.pattern_day_trader),
+                },
+            })
+        except Exception as e:
+            return jsonify({
+                "connected": False,
+                "mode":      mode,
+                "account":   {},
+                "error":     str(e),
+            })
+
     @app.get("/api/mcp_status")
     def api_mcp_status():
         """Check whether the alpaca-mcp-server is reachable."""
