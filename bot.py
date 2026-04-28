@@ -79,7 +79,11 @@ except ImportError:
     _HAS_POLYMARKET = False
     logger.warning("[Bot] polymarket_strategy not found — Polymarket signals disabled")
 
-PRODUCTION = os.getenv("PRODUCTION", "false").lower() == "true"
+PRODUCTION      = os.getenv("PRODUCTION",      "false").lower() == "true"
+USE_ALPACA_PAPER = os.getenv("USE_ALPACA_PAPER", "false").lower() == "true"
+# USE_ALPACA is true when either flag is set — lets you use Alpaca paper
+# without enforcing market hours (PRODUCTION=false keeps hours guard OFF)
+USE_ALPACA = PRODUCTION or USE_ALPACA_PAPER
 ALPACA_MCP_URL = os.getenv("ALPACA_MCP_URL", "http://localhost:3000")
 
 DEFAULT_WATCHLIST = [
@@ -325,13 +329,16 @@ class TradingBot:
         self._trend_min        = trend_min_mentions
         self._portfolio_path   = portfolio_path   # FIX: save/load path
 
-        # Auto-derive market hours enforcement from PRODUCTION flag
+        # Auto-derive market hours enforcement from PRODUCTION flag only
+        # (USE_ALPACA_PAPER does NOT enforce hours — paper trading runs anytime)
         if require_market_hours is None:
             require_market_hours = PRODUCTION
 
-        # Portfolio — paper vs production
-        if PRODUCTION:
-            logger.info("[Bot] 🔴 PRODUCTION mode — using AlpacaBroker")
+        # Portfolio — use AlpacaBroker when either PRODUCTION or USE_ALPACA_PAPER is set
+        if USE_ALPACA:
+            logger.info("[Bot] %s — using AlpacaBroker (%s)",
+                        "🔴 PRODUCTION" if PRODUCTION else "📊 ALPACA PAPER",
+                        os.getenv("ALPACA_BASE_URL", "paper"))
             try:
                 from broker_alpaca import AlpacaBroker
                 self.portfolio = AlpacaBroker()
@@ -398,7 +405,7 @@ class TradingBot:
 
         print(f"\n{'═'*70}")
         print(f"  📡  Scan  {time.strftime('%Y-%m-%d  %H:%M:%S')}"
-              f"  [{'PRODUCTION 🔴' if PRODUCTION else 'PAPER 📄'}]")
+              f"  [{'PRODUCTION 🔴' if PRODUCTION else 'ALPACA PAPER 📊' if USE_ALPACA_PAPER else 'PAPER 📄'}]")
         print(f"{'═'*70}")
 
         # Guard 1 — market hours
@@ -540,7 +547,7 @@ class TradingBot:
     # ── Continuous loop ───────────────────────────────────────────────────
 
     async def run_loop(self, interval_minutes: int = 15):
-        mode = "PRODUCTION 🔴 LIVE" if PRODUCTION else "PAPER 📄"
+        mode = "PRODUCTION 🔴 LIVE" if PRODUCTION else ("ALPACA PAPER 📊" if USE_ALPACA_PAPER else "PAPER 📄")
         strat = self.engine._strategies[0] if self.engine._strategies else None
         print(f"\n🚀  TradingBot v3  [{mode}]")
         print(f"   Model         : Replicate / Llama-3-70B")

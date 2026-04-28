@@ -619,8 +619,10 @@ async function checkAlpaca() {
     document.getElementById('alpacaEquity').textContent      = fmt2(acct.equity);
     document.getElementById('alpacaBP').textContent          = fmt2(acct.buying_power);
     const statusEl = document.getElementById('alpacaAcctStatus');
-    statusEl.textContent = acct.status || '—';
-    statusEl.className   = 'alpaca-row-val ' + (acct.status === 'ACTIVE' ? 'green' : 'red');
+    const rawStatus = acct.status || '—';
+    const cleanStatus = rawStatus.includes('.') ? rawStatus.split('.').pop() : rawStatus;
+    statusEl.textContent = cleanStatus;
+    statusEl.className   = 'alpaca-row-val ' + (cleanStatus === 'ACTIVE' ? 'green' : 'red');
     errEl.style.display  = 'none';
   } else {
     badge.className      = r.mode === 'internal' ? 'alpaca-badge internal' : 'alpaca-badge disconnected';
