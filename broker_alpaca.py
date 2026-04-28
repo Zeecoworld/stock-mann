@@ -10,20 +10,29 @@ class AlpacaBroker:
     """
     Wraps Alpaca TradingClient to match PaperPortfolio's interface
     so bot.py can swap between paper and live trading with zero code changes.
+
+    Verified against alpaca-py 0.43.3 docs:
+      - submit_order() takes order_data= keyword arg (not positional)
+      - close_position() takes symbol_or_asset_id= keyword arg
+      - get_all_positions() returns Position objects with .qty (not .shares)
+        and .avg_entry_price (not .avg_cost)
+      - position_exists() uses get_open_position(symbol) which raises
+        APIError if no position — cleaner than fetching all positions
     """
 
     def __init__(self):
         try:
             from alpaca.trading.client   import TradingClient
-            from alpaca.trading.requests import MarketOrderRequest
+            from alpaca.trading.requests import MarketOrderRequest, ClosePositionRequest
             from alpaca.trading.enums    import OrderSide, TimeInForce
-            self._TC  = TradingClient
-            self._MOR = MarketOrderRequest
-            self._OS  = OrderSide
-            self._TIF = TimeInForce
+            self._TC   = TradingClient
+            self._MOR  = MarketOrderRequest
+            self._CPR  = ClosePositionRequest
+            self._OS   = OrderSide
+            self._TIF  = TimeInForce
         except ImportError:
             raise ImportError(
-                "alpaca-py not installed. Run: pip install alpaca-py"
+                "alpaca-py not installed. Run: pip install alpaca-py==0.43.3"
             )
 
         key    = os.getenv("ALPACA_API_KEY")
@@ -38,7 +47,8 @@ class AlpacaBroker:
 
         is_paper = "paper-api" in ALPACA_BASE_URL
         try:
-            self.client = self._TC(key, secret, paper=is_paper)
+            self.client  = self._TC(key, secret, paper=is_paper)
+            self._is_paper = is_paper
             acct = self.client.get_account()
         except Exception as e:
             raise ConnectionError(
@@ -60,14 +70,17 @@ class AlpacaBroker:
     # ── PaperPortfolio interface ──────────────────────────────────────────
 
     def position_exists(self, ticker: str) -> bool:
-        """Check whether we currently hold this ticker (any key format)."""
+        """
+        FIX (alpaca-py 0.43.3): use get_open_position(symbol) which raises
+        an APIError / exception when no position exists — faster than
+        fetching all positions and scanning the list.
+        """
         symbol = ticker.lstrip("$").upper()
         try:
-            positions = self.client.get_all_positions()
-            held = {p.symbol.upper() for p in positions}
-            return symbol in held
-        except Exception as e:
-            logger.warning("[Alpaca] position_exists check failed: %s", e)
+            self.client.get_open_position(symbol)
+            return True
+        except Exception:
+            # Any exception (APIError 404, connection error) → treat as no position
             return False
 
     def execute_buy(self, ticker, price, confidence, reasoning,
@@ -75,14 +88,16 @@ class AlpacaBroker:
         symbol   = ticker.lstrip("$").upper()
         notional = notional or _DEFAULT_NOTIONAL
         try:
-            order = self.client.submit_order(self._MOR(
-                symbol=symbol,
-                notional=notional,
-                side=self._OS.BUY,
-                time_in_force=self._TIF.DAY,
-            ))
+            # FIX (alpaca-py 0.43.3): submit_order() requires order_data= keyword
+            order = self.client.submit_order(
+                order_data=self._MOR(
+                    symbol=symbol,
+                    notional=notional,          # dollar amount, not shares
+                    side=self._OS.BUY,
+                    time_in_force=self._TIF.DAY,
+                )
+            )
             logger.info("[Alpaca] ✅ BUY  %s  $%.0f  id=%s", symbol, notional, order.id)
-            # Return a duck-typed record so bot.py printing logic works
             return _FakeRecord(ticker=ticker, shares=notional / price,
                                price=price, pnl=0.0)
         except Exception as e:
@@ -92,7 +107,9 @@ class AlpacaBroker:
     def execute_sell(self, ticker, price, confidence, reasoning):
         symbol = ticker.lstrip("$").upper()
         try:
-            self.client.close_position(symbol)
+            # FIX (alpaca-py 0.43.3): close_position() requires
+            # symbol_or_asset_id= keyword arg, not positional
+            self.client.close_position(symbol_or_asset_id=symbol)
             logger.info("[Alpaca] ✅ SELL %s", symbol)
             return _FakeRecord(ticker=ticker, shares=0, price=price, pnl=0.0)
         except Exception as e:
@@ -105,10 +122,16 @@ class AlpacaBroker:
 
     def snapshot(self, prices=None) -> dict:
         try:
-            acct = self.client.get_account()
+            acct      = self.client.get_account()
             positions = self.client.get_all_positions()
-            pos_out = {}
+            pos_out   = {}
             for p in positions:
+                # FIX (alpaca-py 0.43.3): Position model fields are:
+                #   p.qty            (not p.shares)
+                #   p.avg_entry_price (not p.avg_cost)
+                #   p.current_price  (may be None pre-market)
+                #   p.unrealized_pl  (not p.unrealized_pnl)
+                #   p.unrealized_plpc (as a decimal, e.g. 0.05 = 5%)
                 pos_out[p.symbol] = {
                     "shares":         float(p.qty),
                     "avg_price":      float(p.avg_entry_price),
