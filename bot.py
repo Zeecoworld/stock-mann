@@ -63,10 +63,10 @@ try:
     from strategy_engine.stock_strategy  import StockSentimentStrategy
     from strategy_engine.news_fetcher    import GoogleNewsRSSFetcher
 except ImportError:
-    from strategy_engine.engine          import MarketContext, Signal, SignalBus, StrategyEngine, TradeSignal
-    from strategy_engine.sentiment_agent import SentimentAgent
-    from strategy_engine.stock_strategy  import StockSentimentStrategy
-    from strategy_engine.news_fetcher    import GoogleNewsRSSFetcher
+    from engine          import MarketContext, Signal, SignalBus, StrategyEngine, TradeSignal
+    from sentiment_agent import SentimentAgent
+    from stock_strategy  import StockSentimentStrategy
+    from news_fetcher    import GoogleNewsRSSFetcher
 
 # Optional Polymarket strategy
 try:
@@ -89,13 +89,80 @@ DEFAULT_WATCHLIST = [
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Price fetcher — v8 → v7 → v10 fallback chain
-# FIX: v8 alone is flaky in cloud IPs; we now try three Yahoo endpoints
+# Price fetcher — Alpaca market data (primary) → Yahoo fallback chain
+#
+# FIX: Yahoo Finance v8/v7/v10 are all blocked on cloud IPs within days of
+# deployment. Alpaca's own market data API is free with any paper/live account,
+# returns reliable OHLCV data, and requires no extra setup — the same
+# ALPACA_API_KEY / ALPACA_SECRET_KEY already used for trading are used here.
+#
+# Fallback order:
+#   1. Alpaca Data API v2  (requires ALPACA_API_KEY + ALPACA_SECRET_KEY)
+#   2. Yahoo Finance v8    (works on home IPs; blocked on most cloud servers)
+#   3. Yahoo Finance v7    (quote endpoint — different IP path, sometimes works)
+#   4. Yahoo Finance v10   (quoteSummary — last resort)
 # ─────────────────────────────────────────────────────────────────────────────
+
+_ALPACA_DATA_BASE = "https://data.alpaca.markets"
+
+async def _try_alpaca_price(symbol: str) -> Optional[Dict]:
+    """
+    Fetch latest bar + 20-day close history from Alpaca Data API v2.
+    Uses the same ALPACA_API_KEY / ALPACA_SECRET_KEY as the broker.
+    Returns {"price": float, "ma_20": float} or None.
+    """
+    key    = os.getenv("ALPACA_API_KEY")
+    secret = os.getenv("ALPACA_SECRET_KEY")
+    if not key or not secret:
+        return None
+    headers = {
+        "APCA-API-KEY-ID":     key,
+        "APCA-API-SECRET-KEY": secret,
+        "Accept":              "application/json",
+    }
+    try:
+        async with httpx.AsyncClient(timeout=12) as c:
+            # Latest snapshot — gives current price immediately
+            snap_r = await c.get(
+                f"{_ALPACA_DATA_BASE}/v2/stocks/{symbol}/snapshot",
+                headers=headers,
+            )
+            snap_r.raise_for_status()
+            snap   = snap_r.json()
+            price  = (snap.get("latestTrade", {}).get("p")
+                      or snap.get("latestQuote", {}).get("ap")
+                      or snap.get("minuteBar", {}).get("c"))
+            if not price:
+                return None
+
+            # 20-day daily bars for MA calculation
+            bars_r = await c.get(
+                f"{_ALPACA_DATA_BASE}/v2/stocks/{symbol}/bars",
+                headers=headers,
+                params={"timeframe": "1Day", "limit": 25, "adjustment": "raw"},
+            )
+            bars_r.raise_for_status()
+            bars   = bars_r.json().get("bars", [])
+            closes = [b["c"] for b in bars if b.get("c")]
+            ma_20  = (sum(closes[-20:]) / len(closes[-20:])
+                      if len(closes) >= 5 else float(price))
+
+            logger.debug("[Price/Alpaca] %s $%.2f MA20=$%.2f", symbol, price, ma_20)
+            return {"price": round(float(price), 2), "ma_20": round(ma_20, 2)}
+    except Exception as e:
+        logger.debug("[Price/Alpaca] %s failed: %s", symbol, e)
+        return None
+
 
 async def fetch_stock_price(ticker: str) -> Optional[Dict]:
     symbol = ticker.lstrip("$").upper()
 
+    # ── Primary: Alpaca Data API ──────────────────────────────────────────
+    result = await _try_alpaca_price(symbol)
+    if result:
+        return result
+
+    # ── Fallbacks: Yahoo Finance (works on home/dev; blocked on cloud) ────
     async def _try_v8():
         async with httpx.AsyncClient(timeout=12) as c:
             r = await c.get(
@@ -150,7 +217,7 @@ async def fetch_stock_price(ticker: str) -> Optional[Dict]:
         except Exception as e:
             logger.debug("[Price/%s] %s failed: %s", label, symbol, e)
 
-    logger.warning("[Price] All sources failed for %s", symbol)
+    logger.warning("[Price] All sources failed for %s — set ALPACA_API_KEY for reliable prices", symbol)
     return None
 
 
@@ -249,12 +316,14 @@ class TradingBot:
         replicate_model:      str       = "meta/meta-llama-3-70b-instruct",
         min_position_size:    float     = 50.0,
         use_alpaca_mcp:       bool      = True,
+        portfolio_path:       str       = "portfolio.json",  # FIX: persistence
     ):
         self.watchlist         = watchlist or DEFAULT_WATCHLIST
         self.interval          = interval_minutes * 60
         self.min_position_size = min_position_size
         self.use_alpaca_mcp    = use_alpaca_mcp
         self._trend_min        = trend_min_mentions
+        self._portfolio_path   = portfolio_path   # FIX: save/load path
 
         # Auto-derive market hours enforcement from PRODUCTION flag
         if require_market_hours is None:
@@ -268,10 +337,13 @@ class TradingBot:
                 self.portfolio = AlpacaBroker()
             except Exception as e:
                 logger.error("[Bot] AlpacaBroker init failed (%s) — falling back to paper", e)
-                self.portfolio = self._make_paper_portfolio()
+                self.portfolio = PaperPortfolio.load(portfolio_path)
         else:
-            logger.info("[Bot] 📄 PAPER mode — using PaperPortfolio")
-            self.portfolio = self._make_paper_portfolio()
+            logger.info("[Bot] 📄 PAPER mode — loading portfolio from %s", portfolio_path)
+            # FIX: load() restores open positions + trade history from the last
+            # run. If the file doesn't exist it returns a fresh portfolio, so
+            # first-run behaviour is unchanged.
+            self.portfolio = PaperPortfolio.load(portfolio_path)
 
         # Sentiment agent
         self.agent = SentimentAgent(model=replicate_model)
@@ -288,8 +360,6 @@ class TradingBot:
                 sentiment_threshold=sentiment_threshold))
 
         self.bus.subscribe(self._on_signal)
-
-        # Guards
         self.hours_guard = MarketHoursGuard() if require_market_hours else None
         if not self.hours_guard:
             logger.info("[Bot] ⚠  Market hours guard DISABLED"
@@ -304,17 +374,6 @@ class TradingBot:
         self._prices:  Dict[str, float] = {}
         self._signals: List[dict]       = []
         self._skipped: List[str]        = []
-
-    @staticmethod
-    def _make_paper_portfolio():
-        return PaperPortfolio(
-            starting_cash=10_000.0,
-            risk_per_trade=0.05,
-            max_positions=5,
-            stop_loss_pct=0.05,
-            take_profit_pct=0.12,
-            min_order_size=50.0,
-        )
 
     # ── Signal handler ────────────────────────────────────────────────────
 
@@ -501,7 +560,7 @@ class TradingBot:
         while True:
             snap = await self.run_once()
             if hasattr(self.portfolio, 'save'):
-                self.portfolio.save("portfolio.json")
+                self.portfolio.save(self._portfolio_path)
 
             blocked = snap.get("blocked", "")
             if blocked and "Market" in blocked and self.hours_guard:

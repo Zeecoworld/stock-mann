@@ -1,7 +1,7 @@
 """
-paper_trader/portfolio.py  — v2 FIXED
+paper_trader/portfolio.py  — v3 FIXED
 ─────────────────────────────────────────────────────────────────────────────
-FIXES vs original:
+FIXES vs v2:
   1. total_value() / check_stops() now handles both "$GOOGL" and "GOOGL" price
      keys — previously broke silently when prices were stored with $ prefix.
   2. execute_buy() now logs WHY it failed (max positions, insufficient cash,
@@ -12,6 +12,14 @@ FIXES vs original:
      from the signal (which uses original $-prefixed ticker) always hit.
   5. Added position_exists() helper used by bot.py to detect duplicates.
   6. summary_str() now shows win rate cleanly.
+
+NEW in v3 (persistence fix):
+  7. save() now writes a full state file (cash + positions + trade_log +
+     config) — not just the display snapshot — so nothing is lost on restart.
+  8. load() classmethod reconstructs a PaperPortfolio from that state file,
+     including all open positions and the full trade history.
+  9. TradingBot calls load() automatically on startup when portfolio.json
+     exists, so a process restart never creates phantom duplicate buys.
 """
 from __future__ import annotations
 
@@ -268,8 +276,112 @@ class PaperPortfolio:
         }
 
     def save(self, path="portfolio.json"):
+        """
+        Persist full portfolio state — cash, open positions, trade log, and
+        config — so load() can reconstruct it exactly after a restart.
+        This replaces the old snapshot()-only save that lost positions on restart.
+        """
+        state = {
+            "_version":       3,
+            "cash":           self.cash,
+            "starting_cash":  self.starting_cash,
+            "risk_per_trade": self.risk_per_trade,
+            "max_positions":  self.max_positions,
+            "stop_loss_pct":  self.stop_loss_pct,
+            "take_profit_pct":self.take_profit_pct,
+            "min_order_size": self.min_order_size,
+            "positions": {
+                ticker: {
+                    "ticker":    p.ticker,
+                    "shares":    p.shares,
+                    "avg_price": p.avg_price,
+                    "source":    p.source,
+                    "opened_at": p.opened_at,
+                }
+                for ticker, p in self.positions.items()
+            },
+            "trade_log": [asdict(t) for t in self.trade_log],
+        }
         with open(path, "w") as f:
-            json.dump(self.snapshot(), f, indent=2)
+            json.dump(state, f, indent=2)
+        logger.info("[Portfolio] Saved to %s  (positions=%d  trades=%d)",
+                    path, len(self.positions), len(self.trade_log))
+
+    @classmethod
+    def load(cls, path="portfolio.json") -> "PaperPortfolio":
+        """
+        Reconstruct a PaperPortfolio from a state file written by save().
+        Restores cash, all open positions, and the full trade log.
+        Returns a fresh PaperPortfolio (with defaults) if the file is missing
+        or corrupt — never raises.
+        """
+        import os
+        if not os.path.exists(path):
+            logger.info("[Portfolio] No state file at %s — starting fresh", path)
+            return cls()
+        try:
+            with open(path) as f:
+                state = json.load(f)
+
+            # Support old snapshot-only saves (v1/v2): they have no "_version"
+            # key and no raw "positions" with avg_price. Fall back to fresh.
+            if state.get("_version", 1) < 3:
+                logger.warning(
+                    "[Portfolio] State file %s is old format (pre-v3) — "
+                    "cannot restore positions. Starting fresh. "
+                    "Run the bot once to create an up-to-date state file.", path
+                )
+                return cls(starting_cash=state.get("starting_cash", 10_000.0))
+
+            p = cls(
+                starting_cash   = state["starting_cash"],
+                risk_per_trade  = state.get("risk_per_trade",  0.05),
+                max_positions   = state.get("max_positions",   5),
+                stop_loss_pct   = state.get("stop_loss_pct",   0.05),
+                take_profit_pct = state.get("take_profit_pct", 0.12),
+                min_order_size  = state.get("min_order_size",  50.0),
+            )
+            p.cash = state["cash"]
+
+            # Restore open positions
+            for ticker, pos_data in state.get("positions", {}).items():
+                p.positions[ticker] = Position(
+                    ticker    = pos_data["ticker"],
+                    shares    = pos_data["shares"],
+                    avg_price = pos_data["avg_price"],
+                    source    = pos_data.get("source", "stock"),
+                    opened_at = pos_data.get("opened_at", time.time()),
+                )
+
+            # Restore full trade log
+            for rec in state.get("trade_log", []):
+                p.trade_log.append(TradeRecord(
+                    timestamp  = rec["timestamp"],
+                    ticker     = rec["ticker"],
+                    action     = rec["action"],
+                    shares     = rec["shares"],
+                    price      = rec["price"],
+                    pnl        = rec.get("pnl", 0.0),
+                    reasoning  = rec.get("reasoning", ""),
+                    confidence = rec.get("confidence", 0.0),
+                    source     = rec.get("source", "stock"),
+                ))
+
+            logger.info(
+                "[Portfolio] Loaded from %s — cash=$%.2f  positions=%d  trades=%d",
+                path, p.cash, len(p.positions), len(p.trade_log),
+            )
+            if p.positions:
+                for t, pos in p.positions.items():
+                    logger.info("  [Portfolio]   holding %s  %.4f sh @ $%.2f",
+                                t, pos.shares, pos.avg_price)
+            return p
+
+        except Exception as exc:
+            logger.error(
+                "[Portfolio] Failed to load %s (%s) — starting fresh", path, exc
+            )
+            return cls()
 
     def summary_str(self, prices=None):
         s = self.snapshot(prices or {})

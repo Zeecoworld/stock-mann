@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 import logging, os
 logger = logging.getLogger(__name__)
@@ -134,7 +133,21 @@ class AlpacaBroker:
             logger.error("[Alpaca] snapshot error: %s", e)
             return {"cash": 0, "total_value": 0, "positions": {}}
 
-    def save(self, path=""): pass   # Alpaca is cloud-persisted
+    def save(self, path=""): pass   # Alpaca is cloud-persisted — no local state needed
+
+    @classmethod
+    def load(cls, path="portfolio.json") -> "AlpacaBroker":
+        """
+        Drop-in equivalent of PaperPortfolio.load() so bot.py can call
+        PaperPortfolio.load() or AlpacaBroker.load() interchangeably.
+        Alpaca state lives in the cloud — we just instantiate a fresh client.
+        The path argument is accepted but ignored.
+        """
+        import logging as _log
+        _log.getLogger(__name__).info(
+            "[Alpaca] load() called — state is cloud-persisted, connecting fresh"
+        )
+        return cls()
 
     def summary_str(self, prices=None) -> str:
         try:

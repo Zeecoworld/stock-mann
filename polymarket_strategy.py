@@ -1,7 +1,6 @@
-
 from __future__ import annotations
 try:
-    from strategy_engine.engine import BaseStrategy, MarketContext, Signal, TradeSignal
+    from engine import BaseStrategy, MarketContext, Signal, TradeSignal
 except ImportError:
     from engine import BaseStrategy, MarketContext, Signal, TradeSignal
 

@@ -140,7 +140,7 @@ class BotState:
                 try:
                     snap = await bot.run_once()
                     if hasattr(bot.portfolio, 'save'):
-                        bot.portfolio.save("portfolio.json")
+                        bot.portfolio.save(bot._portfolio_path)
                     with self._lock:
                         self._last_snapshot = snap
                         self._last_scan_ts  = time.strftime("%Y-%m-%d %H:%M:%S")

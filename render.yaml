@@ -1,0 +1,27 @@
+services:
+  - type: web
+    name: trading-bot
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn "app:create_app()" --workers 1 --threads 2 --timeout 120 --bind 0.0.0.0:$PORT
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.0
+      - key: PRODUCTION
+        value: "false"
+      - key: USE_ALPACA_PAPER
+        value: "true"
+      - key: ALPACA_BASE_URL
+        value: https://paper-api.alpaca.markets
+      # ── Set these in Render dashboard, NOT here (keep secrets out of Git) ──
+      - key: ALPACA_API_KEY
+        sync: false
+      - key: ALPACA_SECRET_KEY
+        sync: false
+      - key: REPLICATE_API_TOKEN
+        sync: false
+      # ── Optional ──
+      - key: NEWSAPI_KEY
+        sync: false
+      - key: FINNHUB_TOKEN
+        sync: false

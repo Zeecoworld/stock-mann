@@ -1,37 +1,12 @@
-"""
-strategy_engine/stock_strategy.py  — v2
-─────────────────────────────────────────────────────────────────────────────
-Strategy for traditional stock/equity bots.
 
-Logic:
-  BUY  if sentiment >= sentiment_threshold AND price > ma_20
-  SELL if sentiment <= -sentiment_threshold AND price < ma_20
-  HOLD in all other cases
-
-FIXES vs v1:
-  1. Default thresholds lowered: sentiment 0.15 (was 0.30), confidence 0.35
-     (was 0.50) — aligns with SentimentAgent and bot.py defaults so the
-     three components can't accidentally have conflicting defaults.
-  2. Added MCP-context branch: if ctx.raw_news contains an Alpaca account
-     context block, the strategy notes it in the reasoning string for audit.
-  3. Explicit logging of every branch taken — no more silent SKIP falls.
-  4. SKIP reason is now descriptive enough to debug from logs alone.
-"""
 from __future__ import annotations
 try:
-    from strategy_engine.engine import BaseStrategy, MarketContext, Signal, TradeSignal
+    from .engine import BaseStrategy, MarketContext, Signal, TradeSignal
 except ImportError:
     from engine import BaseStrategy, MarketContext, Signal, TradeSignal
 
 
 class StockSentimentStrategy(BaseStrategy):
-    """
-    Combines LLM sentiment score + 20-day MA crossover to produce signals.
-
-    Args:
-        sentiment_threshold:  minimum |score| to act  (default 0.15)
-        confidence_threshold: minimum agent confidence (default 0.35)
-    """
 
     name = "stock"
 
@@ -103,7 +78,6 @@ class StockSentimentStrategy(BaseStrategy):
                 f"Bearish ({score:+.2f}) — no MA data, sentiment-only exit{mcp_tag}"
             )
 
-        # ── HOLD (neutral) ────────────────────────────────────────────────
         return self._signal(
             Signal.HOLD, ctx, conf,
             f"Neutral score ({score:+.2f}) within ±{self.sentiment_threshold}"
