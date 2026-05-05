@@ -332,7 +332,7 @@ class TradingBot:
         # Auto-derive market hours enforcement from PRODUCTION flag only
         # (USE_ALPACA_PAPER does NOT enforce hours — paper trading runs anytime)
         if require_market_hours is None:
-            require_market_hours = PRODUCTION
+           require_market_hours = USE_ALPACA
 
         # Portfolio — use AlpacaBroker when either PRODUCTION or USE_ALPACA_PAPER is set
         if USE_ALPACA:
@@ -472,8 +472,11 @@ class TradingBot:
             enriched_news = headlines + ([mcp_context] if mcp_context else [])
 
             # Strategy evaluation
+            is_crypto_or_poly = not ticker.startswith("$")
+            source_type = "polymarket" if is_crypto_or_poly else "stock"
+
             signal = await self.engine.run(MarketContext(
-                ticker=ticker, source="stock",
+                ticker=ticker, source=source_type,
                 price=price, ma_20=ma_20,
                 raw_news=enriched_news,
             ))

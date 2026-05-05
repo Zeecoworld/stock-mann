@@ -59,7 +59,7 @@ class AlpacaBroker:
             )
 
         # Mirror PaperPortfolio attributes used by bot.py
-        self.starting_cash  = float(acct.cash)
+        self.starting_cash  = float(acct.equity)
         self.risk_per_trade = 0.05        # informational only — Alpaca uses notional
         self.max_positions  = 10          # Alpaca doesn't enforce this — advisory
 

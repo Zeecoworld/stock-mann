@@ -551,7 +551,7 @@ function render(data) {
   document.getElementById('cash').textContent       = fmt(p.cash);
   document.getElementById('totalValue').textContent = fmt(p.total_value ?? p.cash);
   const pnlEl  = document.getElementById('pnl');
-  const pnlVal = p.unrealised_pnl ?? p.pnl ?? 0;
+  const pnlVal = p.total_pnl ?? p.unrealised_pnl ?? p.pnl ?? 0;
   pnlEl.textContent = (pnlVal >= 0 ? '+' : '') + fmt(pnlVal);
   pnlEl.className   = 'stat-value ' + (pnlVal >= 0 ? 'green' : 'red');
 
