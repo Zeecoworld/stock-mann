@@ -259,14 +259,18 @@ class PaperPortfolio:
             }
         total_val = self.total_value(prices)
         total_pnl = self.total_pnl(prices)
+        cost_basis = sum(p.cost_basis for p in self.positions.values())
+        unrealised = (total_val - self.cash) - cost_basis
+        
         return {
             "cash":            round(self.cash, 2),
             "starting_cash":   self.starting_cash,
             "total_value":     round(total_val, 2),
+            "daily_pnl":       round(total_pnl, 2),  
             "total_pnl":       round(total_pnl, 2),
             "total_pnl_pct":   round(self.total_pnl_pct(prices) * 100, 2),
             "realised_pnl":    round(self.realised_pnl(), 2),
-            "unrealised_pnl":  round(total_val - self.cash - self.starting_cash + self.cash, 2),
+            "unrealised_pnl":  round(unrealised, 2),
             "win_rate":        round(self.win_rate() * 100, 2),
             "num_positions":   len(self.positions),
             "num_trades":      len(self.trade_log),

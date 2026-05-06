@@ -162,7 +162,7 @@
   /* PORTFOLIO STATS */
   .stat-grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; margin-bottom: 18px; }
   .stat-label { color: var(--text-dim); font-size: 10px; margin-bottom: 3px; }
-  .stat-value { font-size: 16px; font-weight: 700; letter-spacing: -.3px; word-break: break-all; }
+  .stat-value { font-size: 16px; font-weight: 700; letter-spacing: -.3px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .stat-value.green { color: var(--green); }
   .stat-value.red   { color: var(--red); }
 
@@ -551,7 +551,7 @@ function render(data) {
   document.getElementById('cash').textContent       = fmt(p.cash);
   document.getElementById('totalValue').textContent = fmt(p.total_value ?? p.cash);
   const pnlEl  = document.getElementById('pnl');
-  const pnlVal = p.total_pnl ?? p.unrealised_pnl ?? p.pnl ?? 0;
+  const pnlVal = p.daily_pnl ?? p.total_pnl ?? p.unrealised_pnl ?? p.pnl ?? 0;
   pnlEl.textContent = (pnlVal >= 0 ? '+' : '') + fmt(pnlVal);
   pnlEl.className   = 'stat-value ' + (pnlVal >= 0 ? 'green' : 'red');
 
