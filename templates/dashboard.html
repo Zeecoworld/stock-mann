@@ -89,10 +89,10 @@
   }
   .tab-btn.active { color: var(--green); border-bottom-color: var(--green); }
 
-  /* MAIN 3-COL LAYOUT */
+  /* MAIN 3-COL LAYOUT - WIDENED LEFT PANEL */
   .main-layout {
     display: grid;
-    grid-template-columns: 260px 1fr 300px;
+    grid-template-columns: 280px 1fr 300px; /* Increased from 260px to 280px */
     gap: 1px;
     background: var(--border);
     min-height: calc(100vh - 53px);
@@ -160,9 +160,10 @@
   .alpaca-recheck:hover { color: var(--blue); }
 
   /* PORTFOLIO STATS */
-  .stat-grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; margin-bottom: 18px; }
+  .stat-grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px; margin-bottom: 18px; }
   .stat-label { color: var(--text-dim); font-size: 10px; margin-bottom: 3px; }
-  .stat-value { font-size: 16px; font-weight: 700; letter-spacing: -.3px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  /* Updated stat-value to prevent wrapping and fit into columns gracefully */
+  .stat-value { font-size: 14.5px; font-weight: 700; letter-spacing: -.6px; white-space: nowrap; }
   .stat-value.green { color: var(--green); }
   .stat-value.red   { color: var(--red); }
 
@@ -284,7 +285,7 @@
 
   /* Tablet ≤1024px: drop right col into "Market" tab */
   @media (max-width: 1024px) {
-    .main-layout { grid-template-columns: 240px 1fr; }
+    .main-layout { grid-template-columns: 260px 1fr; }
     .right-col { display: none; }
     .tab-bar { display: block; }
     /* When "Market" tab is active, show right-col as full row */
@@ -361,10 +362,8 @@
 
 <div class="main-layout" id="mainLayout">
 
-  <!-- LEFT: Controls -->
   <div class="panel left-panel tab-active" id="tab-left">
 
-    <!-- ALPACA CONNECTION STATUS -->
     <div class="alpaca-status" id="alpacaStatusBox">
       <div class="alpaca-status-header">
         <span class="alpaca-status-title">Alpaca API</span>
@@ -430,7 +429,6 @@
     <button class="btn btn-blue" onclick="saveConfig()">↑ Save Config</button>
   </div>
 
-  <!-- CENTER: Signals -->
   <div class="panel center-panel" id="tab-center">
     <div class="panel-title">
       Signal Feed
@@ -444,7 +442,6 @@
     </div>
   </div>
 
-  <!-- RIGHT: Trending + Positions -->
   <div class="right-col" id="tab-right">
     <div class="panel">
       <div class="panel-title">Trending Tickers</div>
@@ -551,7 +548,10 @@ function render(data) {
   document.getElementById('cash').textContent       = fmt(p.cash);
   document.getElementById('totalValue').textContent = fmt(p.total_value ?? p.cash);
   const pnlEl  = document.getElementById('pnl');
+  
+  // FIXED JS Logic: Prioritizes daily_pnl over other PnL metrics
   const pnlVal = p.daily_pnl ?? p.total_pnl ?? p.unrealised_pnl ?? p.pnl ?? 0;
+  
   pnlEl.textContent = (pnlVal >= 0 ? '+' : '') + fmt(pnlVal);
   pnlEl.className   = 'stat-value ' + (pnlVal >= 0 ? 'green' : 'red');
 
