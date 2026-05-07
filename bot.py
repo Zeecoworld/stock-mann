@@ -36,6 +36,9 @@ from __future__ import annotations
 
 import asyncio, logging, os, time
 from typing import Dict, List, Optional
+import pandas as pd
+import pandas_ta as ta
+import yfinance as yf
 
 import httpx
 from dotenv import load_dotenv
@@ -158,71 +161,41 @@ async def _try_alpaca_price(symbol: str) -> Optional[Dict]:
         return None
 
 
-async def fetch_stock_price(ticker: str) -> Optional[Dict]:
-    symbol = ticker.lstrip("$").upper()
 
-    # ── Primary: Alpaca Data API ──────────────────────────────────────────
-    result = await _try_alpaca_price(symbol)
-    if result:
-        return result
 
-    # ── Fallbacks: Yahoo Finance (works on home/dev; blocked on cloud) ────
-    async def _try_v8():
-        async with httpx.AsyncClient(timeout=12) as c:
-            r = await c.get(
-                f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}",
-                params={"interval": "1d", "range": "1mo"},
-                headers={"User-Agent": "Mozilla/5.0"},
-            )
-            r.raise_for_status()
-            closes = r.json()["chart"]["result"][0]["indicators"]["quote"][0]["close"]
-            closes = [x for x in closes if x is not None]
-            if not closes: return None
-            price = closes[-1]
-            ma_20 = sum(closes[-20:]) / len(closes[-20:]) if len(closes) >= 5 else price
-            return {"price": round(price, 2), "ma_20": round(ma_20, 2)}
+def fetch_enriched_market_data(ticker_symbol: str) -> dict:
+    """Fetches price + advanced TA to prevent whipsaws."""
+    try:
+        # Fetch 60 days to give the MAs and ADX enough runway to calculate
+        df = yf.download(ticker_symbol, period="60d", interval="1d", progress=False)
+        if df.empty:
+            return {}
 
-    async def _try_v7():
-        async with httpx.AsyncClient(timeout=12) as c:
-            r = await c.get(
-                "https://query1.finance.yahoo.com/v7/finance/quote",
-                params={"symbols": symbol},
-                headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"},
-            )
-            r.raise_for_status()
-            data = r.json()["quoteResponse"]["result"]
-            if not data: return None
-            q = data[0]
-            price = q.get("regularMarketPrice") or q.get("postMarketPrice")
-            if not price: return None
-            ma_20 = q.get("fiftyDayAverage") or price
-            return {"price": round(float(price), 2), "ma_20": round(float(ma_20), 2)}
+        # 1. Moving Averages
+        df['MA20'] = ta.sma(df['Close'], length=20)
+        df['Vol_SMA20'] = ta.sma(df['Volume'], length=20)
+        
+        # 2. Average True Range (Volatility)
+        df['ATR'] = ta.atr(df['High'], df['Low'], df['Close'], length=14)
+        
+        # 3. Average Directional Index (Trend Strength)
+        adx_df = ta.adx(df['High'], df['Low'], df['Close'], length=14)
+        df['ADX'] = adx_df['ADX_14'] if adx_df is not None else 0.0
 
-    async def _try_v10():
-        async with httpx.AsyncClient(timeout=12) as c:
-            r = await c.get(
-                f"https://query2.finance.yahoo.com/v10/finance/quoteSummary/{symbol}",
-                params={"modules": "price"},
-                headers={"User-Agent": "Mozilla/5.0"},
-            )
-            r.raise_for_status()
-            pd = r.json()["quoteSummary"]["result"][0]["price"]
-            price = pd["regularMarketPrice"]["raw"]
-            ma_20 = pd.get("fiftyDayAverage", {}).get("raw", price)
-            return {"price": round(float(price), 2), "ma_20": round(float(ma_20), 2)}
+        # Grab the latest valid candle
+        latest = df.iloc[-1]
 
-    for fn, label in [(_try_v8, "v8"), (_try_v7, "v7"), (_try_v10, "v10")]:
-        try:
-            result = await fn()
-            if result:
-                logger.debug("[Price/%s] %s $%.2f MA20=$%.2f",
-                             label, symbol, result["price"], result["ma_20"])
-                return result
-        except Exception as e:
-            logger.debug("[Price/%s] %s failed: %s", label, symbol, e)
-
-    logger.warning("[Price] All sources failed for %s — set ALPACA_API_KEY for reliable prices", symbol)
-    return None
+        return {
+            "price": float(latest['Close']),
+            "ma_20": float(latest['MA20']),
+            "volume": float(latest['Volume']),
+            "vol_sma20": float(latest['Vol_SMA20']),
+            "atr": float(latest['ATR']),
+            "adx": float(latest['ADX'])
+        }
+    except Exception as e:
+        logger.error(f"Error fetching TA data for {ticker_symbol}: {e}")
+        return {}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -442,32 +415,33 @@ class TradingBot:
                 self._skipped.append(ticker)
                 continue
 
-            # Price fetch — 3-endpoint fallback
-            pd = await fetch_stock_price(ticker)
-            if not pd:
-                print(f"     ⚠  Price unavailable → skip")
+           
+            ta_data = fetch_enriched_market_data(ticker)
+            if not ta_data or ta_data.get("price") is None:
+                print(f"    ⚠  Price/TA data unavailable → skip")
                 self._skipped.append(ticker)
                 continue
 
-            price, ma_20 = pd["price"], pd["ma_20"]
+            price = ta_data["price"]
+            ma_20 = ta_data["ma_20"]
             clean_sym = ticker.lstrip("$").upper()
             self._prices[ticker]    = price
             self._prices[clean_sym] = price
-            print(f"     💲 ${price:.2f}  MA20=${ma_20:.2f}  "
+            print(f"    💲 ${price:.2f}  MA20=${ma_20:.2f}  ADX={ta_data['adx']:.1f}  "
                   f"mentions={self.trend_filter.mention_count(ticker)}")
 
             # Headlines
             headlines = await fetch_ticker_headlines(ticker, max_results=15)
-            print(f"     📰 {len(headlines)} headlines → Replicate…")
+            print(f"    📰 {len(headlines)} headlines → Replicate…")
             if headlines:
-                print(f"     📄 Top: {headlines[0][:80]}")
+                print(f"    📄 Top: {headlines[0][:80]}")
 
             # Alpaca MCP context injection
             mcp_context = ""
             if self.use_alpaca_mcp:
                 mcp_context = await fetch_alpaca_mcp_context(ticker)
                 if mcp_context:
-                    print(f"     🔗 Alpaca MCP context injected")
+                    print(f"    🔗 Alpaca MCP context injected")
 
             enriched_news = headlines + ([mcp_context] if mcp_context else [])
 
@@ -475,39 +449,18 @@ class TradingBot:
             is_crypto_or_poly = not ticker.startswith("$")
             source_type = "polymarket" if is_crypto_or_poly else "stock"
 
+            # Pass the new technical indicators into MarketContext
             signal = await self.engine.run(MarketContext(
-                ticker=ticker, source=source_type,
-                price=price, ma_20=ma_20,
+                ticker=ticker, 
+                source=source_type,
+                price=price, 
+                ma_20=ma_20,
+                adx=ta_data["adx"],
+                atr=ta_data["atr"],
+                volume=ta_data["volume"],
+                vol_sma20=ta_data["vol_sma20"],
                 raw_news=enriched_news,
             ))
-
-            if not signal:
-                print(f"     ⚠  No strategy matched source='stock'")
-                continue
-
-            # Always print the signal — no silent outcomes
-            print(f"     → {signal.signal.value}  conf={signal.confidence:.0%}  "
-                  f"| {signal.reasoning[:100]}")
-
-            if signal.signal in (Signal.BUY, Signal.SELL):
-                if self.throttle.is_blocked(ticker, signal.signal.value):
-                    print(f"     🔁 Throttled — {signal.signal.value} on {ticker} in cooldown")
-                    continue
-                self._execute(signal, price)
-                self.throttle.record(ticker, signal.signal.value)
-
-            # Stop/take-profit check after each ticker
-            stops = self.portfolio.check_stops(self._prices)
-            for s in stops:
-                print(f"  🛑 STOP: {s.ticker}  PnL=${s.pnl:+.2f}  {s.reasoning}")
-
-        print(f"\n{'─'*70}")
-        print(f"  {self.portfolio.summary_str(self._prices)}")
-        if self._skipped:
-            print(f"  ⚪ Skipped: {', '.join(self._skipped)}")
-        print(f"{'─'*70}\n")
-
-        return self._snapshot()
 
     def _execute(self, signal: TradeSignal, price: float):
         ticker = signal.ticker

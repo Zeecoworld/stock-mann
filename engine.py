@@ -18,9 +18,13 @@ class Signal(Enum):
 @dataclass
 class MarketContext:
     ticker: str
-    source: str                          # "stock" | "polymarket"
+    source: str                          
     price:  Optional[float] = None
     ma_20:  Optional[float] = None
+    adx:    Optional[float] = None          
+    atr:    Optional[float] = None          
+    volume: Optional[float] = None         
+    vol_sma20: Optional[float] = None 
     raw_news: List[str]     = field(default_factory=list)
     sentiment_score:      Optional[float] = None
     sentiment_confidence: Optional[float] = None

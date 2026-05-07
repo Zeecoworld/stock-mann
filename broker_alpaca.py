@@ -83,25 +83,34 @@ class AlpacaBroker:
             # Any exception (APIError 404, connection error) → treat as no position
             return False
 
-    def execute_buy(self, ticker, price, confidence, reasoning,
-                    source="stock", notional=None):
-        symbol   = ticker.lstrip("$").upper()
-        notional = notional or _DEFAULT_NOTIONAL
+    def execute_buy(self, ticker: str, price: float, conf: float, reason: str, source: str = "stock"):
         try:
-            # FIX (alpaca-py 0.43.3): submit_order() requires order_data= keyword
-            order = self.client.submit_order(
-                order_data=self._MOR(
-                    symbol=symbol,
-                    notional=notional,          # dollar amount, not shares
-                    side=self._OS.BUY,
-                    time_in_force=self._TIF.DAY,
-                )
+           
+            bp = self.get_safe_buying_power()
+            
+         
+            trade_size = min(_DEFAULT_NOTIONAL, bp * 0.95) # 5% buffer
+            
+            if bp < trade_size or bp <= 0:
+                logger.warning(f"[Alpaca] Insufficient buying power (${bp:,.2f}). Skipping {ticker}.")
+                return None
+
+            clean_ticker = ticker.lstrip("$").upper()
+            qty = max(1, int(trade_size / price))
+
+            order_data = self._MOR(
+                symbol=clean_ticker,
+                qty=qty,
+                side=self._OS.BUY,
+                time_in_force=self._TIF.DAY
             )
-            logger.info("[Alpaca] ✅ BUY  %s  $%.0f  id=%s", symbol, notional, order.id)
-            return _FakeRecord(ticker=ticker, shares=notional / price,
-                               price=price, pnl=0.0)
+            
+            order = self.client.submit_order(order_data=order_data)
+            logger.info(f"[Alpaca] BUY Executed: {qty} shares of {clean_ticker} | Order ID: {order.id}")
+            return order
+
         except Exception as e:
-            logger.error("[Alpaca] BUY FAILED %s: %s", symbol, e)
+            logger.error(f"[Alpaca] Failed to execute BUY for {ticker}: {e}")
             return None
 
     def execute_sell(self, ticker, price, confidence, reasoning):
@@ -187,6 +196,17 @@ class AlpacaBroker:
             return float(self.client.get_account().equity)
         except Exception:
             return self.starting_cash
+        
+    def get_safe_buying_power(self) -> float:
+        try:
+            acct = self.client.get_account()
+            if acct.trading_blocked or acct.account_blocked:
+                logger.warning("[Alpaca] Account is restricted. Buying power = $0")
+                return 0.0
+            return float(acct.buying_power)
+        except Exception as e:
+            logger.error(f"[Alpaca] Error fetching buying power: {e}")
+            return 0.0
 
 
 class _FakeRecord:

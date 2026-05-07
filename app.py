@@ -345,7 +345,6 @@ def create_app() -> Flask:
                     "buying_power":  str(acct.buying_power),
                     "status":        acct.status.value if hasattr(acct.status, 'value') else str(acct.status),
                     "currency":      str(acct.currency),
-                    "pattern_day_trader": bool(acct.pattern_day_trader),
                 },
             })
         except Exception as e:
