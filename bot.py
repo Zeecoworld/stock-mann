@@ -37,7 +37,6 @@ from __future__ import annotations
 import asyncio, logging, os, time
 from typing import Dict, List, Optional
 import pandas as pd
-import pandas_ta as ta
 import yfinance as yf
 
 import httpx
