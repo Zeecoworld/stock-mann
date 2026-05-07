@@ -96,13 +96,15 @@ class AlpacaBroker:
                 return None
 
             clean_ticker = ticker.lstrip("$").upper()
-            qty = max(1, int(trade_size / price))
-
+            qty = trade_size / price  # fractional
+            if qty < 0.01:
+                logger.warning("[Alpaca] Order qty too small for %s — skip", ticker)
+                return None
             order_data = self._MOR(
                 symbol=clean_ticker,
-                qty=qty,
+                notional=round(trade_size, 2),   # use notional instead of qty
                 side=self._OS.BUY,
-                time_in_force=self._TIF.DAY
+                time_in_force=self._TIF.DAY,
             )
             
             order = self.client.submit_order(order_data=order_data)

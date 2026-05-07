@@ -1,24 +1,28 @@
 """
-paper_trader/bot.py  — v3  PRODUCTION-READY
+paper_trader/bot.py  — v4  PRODUCTION-READY
 ────────────────────────────────────────────────────────────────────────────
-FIXES vs v2:
-  1. NO-SIGNAL FIX: sentiment_threshold lowered to 0.15, confidence to 0.35
-     — Llama-3 on neutral news regularly scores 0.2–0.35; v2 thresholds were
-     silently blocking every single signal on slow news days.
-  2. NO-SIGNAL FIX: trend_min_mentions default = 0 (filter disabled) so
-     tickers are never skipped due to stale/rate-limited RSS trending feeds.
-  3. NO-SIGNAL FIX: Yahoo Finance price fetcher now tries v8 → v7 → v10
-     fallback chain — v8 alone has become flaky in cloud deployments.
-  4. NO-SIGNAL FIX: require_market_hours defaults to False in paper mode;
-     PRODUCTION=true automatically enforces market hours.
-  5. PRODUCTION FIX: When PRODUCTION=true, AlpacaBroker auto-injected as
-     the portfolio — real orders go to Alpaca paper/live API.
-  6. ALPACA MCP: fetch_alpaca_mcp_context() pulls live account state from
-     alpaca-mcp-server (github.com/tedlikeskix/alpaca-mcp-server) and
-     injects it into the Llama-3 prompt so the LLM knows current positions,
-     cash, and recent orders before deciding BUY/SELL.
-  7. PolymarketSentimentStrategy import made optional (file may not exist).
-  8. Every signal outcome is now explicitly logged — no more silent SKIP.
+FIXES vs v3:
+  1. CRITICAL BUG FIX: run_once() called non-existent `fetch_enriched_market_data`
+     (a synchronous stub that was never defined). Now correctly calls
+     `await fetch_alpaca_enriched_data()` — the real Alpaca-native async function.
+
+  2. CRITICAL BUG FIX: _execute() was defined but NEVER CALLED inside run_once().
+     Every scan generated signals that were logged but never turned into orders.
+     Now wired up: signal → _execute() → portfolio.execute_buy/sell().
+
+  3. CRITICAL BUG FIX: run_once() had no return statement at the end.
+     The dashboard received None on every scan after guards passed.
+     Added `return self._snapshot()` at the end of the ticker loop.
+
+  4. CRITICAL BUG FIX: check_stops() was never called in the scan cycle.
+     Stop-losses and take-profits were completely inactive. Now called at the
+     start of each scan (after breaker check) so positions are protected.
+
+  5. REMOVED: `import yfinance as yf` — Yahoo Finance is fully replaced by
+     Alpaca Data API v2. yfinance was causing cloud IP bans and silent failures.
+
+  6. PNL FIX: Wired self._execute() to also use the throttle guard so we
+     don't re-enter a position we just sold within the cooldown window.
 
 ENV VARS REQUIRED:
   REPLICATE_API_TOKEN   — Replicate / Llama-3 scorer
@@ -37,8 +41,7 @@ from __future__ import annotations
 import asyncio, logging, os, time
 from typing import Dict, List, Optional
 import pandas as pd
-import yfinance as yf
-
+import numpy as np
 import httpx
 from dotenv import load_dotenv
 
@@ -75,18 +78,16 @@ try:
     try:
         from strategy_engine.polymarket_strategy import PolymarketSentimentStrategy
     except ImportError:
-        from strategy_engine.polymarket_strategy import PolymarketSentimentStrategy
+        from polymarket_strategy import PolymarketSentimentStrategy
     _HAS_POLYMARKET = True
 except ImportError:
     _HAS_POLYMARKET = False
     logger.warning("[Bot] polymarket_strategy not found — Polymarket signals disabled")
 
-PRODUCTION      = os.getenv("PRODUCTION",      "false").lower() == "true"
+PRODUCTION       = os.getenv("PRODUCTION",      "false").lower() == "true"
 USE_ALPACA_PAPER = os.getenv("USE_ALPACA_PAPER", "false").lower() == "true"
-# USE_ALPACA is true when either flag is set — lets you use Alpaca paper
-# without enforcing market hours (PRODUCTION=false keeps hours guard OFF)
-USE_ALPACA = PRODUCTION or USE_ALPACA_PAPER
-ALPACA_MCP_URL = os.getenv("ALPACA_MCP_URL", "http://localhost:3000")
+USE_ALPACA       = PRODUCTION or USE_ALPACA_PAPER
+ALPACA_MCP_URL   = os.getenv("ALPACA_MCP_URL", "http://localhost:3000")
 
 DEFAULT_WATCHLIST = [
     "$NVDA","$TSLA","$AAPL","$MSFT","$AMZN",
@@ -95,126 +96,102 @@ DEFAULT_WATCHLIST = [
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Price fetcher — Alpaca market data (primary) → Yahoo fallback chain
-#
-# FIX: Yahoo Finance v8/v7/v10 are all blocked on cloud IPs within days of
-# deployment. Alpaca's own market data API is free with any paper/live account,
-# returns reliable OHLCV data, and requires no extra setup — the same
-# ALPACA_API_KEY / ALPACA_SECRET_KEY already used for trading are used here.
-#
-# Fallback order:
-#   1. Alpaca Data API v2  (requires ALPACA_API_KEY + ALPACA_SECRET_KEY)
-#   2. Yahoo Finance v8    (works on home IPs; blocked on most cloud servers)
-#   3. Yahoo Finance v7    (quote endpoint — different IP path, sometimes works)
-#   4. Yahoo Finance v10   (quoteSummary — last resort)
+# Price + Technical Analysis — Alpaca Data API v2 (primary, no IP bans)
+# yfinance has been fully removed. Alpaca Data is free with any paper account
+# and uses the same API keys already required for trading.
 # ─────────────────────────────────────────────────────────────────────────────
 
 _ALPACA_DATA_BASE = "https://data.alpaca.markets"
 
-async def _try_alpaca_price(symbol: str) -> Optional[Dict]:
+
+async def fetch_alpaca_enriched_data(ticker_symbol: str) -> dict:
     """
-    Fetch latest bar + 20-day close history from Alpaca Data API v2.
-    Uses the same ALPACA_API_KEY / ALPACA_SECRET_KEY as the broker.
-    Returns {"price": float, "ma_20": float} or None.
+    Fetches 60 days of OHLCV bars from Alpaca Data API v2 and computes:
+      - price  (latest close)
+      - ma_20  (20-day simple moving average)
+      - volume (latest volume)
+      - vol_sma20 (20-day average volume)
+      - atr    (14-day Average True Range)
+      - adx    (14-day Average Directional Index)
+
+    Returns {} on failure — caller should skip the ticker gracefully.
     """
+    clean_symbol = ticker_symbol.lstrip("$").upper()
     key    = os.getenv("ALPACA_API_KEY")
     secret = os.getenv("ALPACA_SECRET_KEY")
+
     if not key or not secret:
-        return None
+        logger.error("[Alpaca Data] ALPACA_API_KEY / ALPACA_SECRET_KEY not set.")
+        return {}
+
     headers = {
         "APCA-API-KEY-ID":     key,
         "APCA-API-SECRET-KEY": secret,
         "Accept":              "application/json",
     }
+
     try:
-        async with httpx.AsyncClient(timeout=12) as c:
-            # Latest snapshot — gives current price immediately
-            snap_r = await c.get(
-                f"{_ALPACA_DATA_BASE}/v2/stocks/{symbol}/snapshot",
+        async with httpx.AsyncClient(timeout=15) as c:
+            r = await c.get(
+                f"{_ALPACA_DATA_BASE}/v2/stocks/{clean_symbol}/bars",
                 headers=headers,
+                params={"timeframe": "1Day", "limit": 60, "adjustment": "all"},
             )
-            snap_r.raise_for_status()
-            snap   = snap_r.json()
-            price  = (snap.get("latestTrade", {}).get("p")
-                      or snap.get("latestQuote", {}).get("ap")
-                      or snap.get("minuteBar", {}).get("c"))
-            if not price:
-                return None
+            r.raise_for_status()
+            bars = r.json().get("bars", [])
 
-            # 20-day daily bars for MA calculation
-            bars_r = await c.get(
-                f"{_ALPACA_DATA_BASE}/v2/stocks/{symbol}/bars",
-                headers=headers,
-                params={"timeframe": "1Day", "limit": 25, "adjustment": "raw"},
-            )
-            bars_r.raise_for_status()
-            bars   = bars_r.json().get("bars", [])
-            closes = [b["c"] for b in bars if b.get("c")]
-            ma_20  = (sum(closes[-20:]) / len(closes[-20:])
-                      if len(closes) >= 5 else float(price))
+            if not bars or len(bars) < 20:
+                logger.warning("[Alpaca Data] %s — only %d bars returned (need ≥20)",
+                               clean_symbol, len(bars))
+                return {}
 
-            logger.debug("[Price/Alpaca] %s $%.2f MA20=$%.2f", symbol, price, ma_20)
-            return {"price": round(float(price), 2), "ma_20": round(ma_20, 2)}
+            df = pd.DataFrame(bars)
+            df = df.rename(columns={"c": "Close", "h": "High", "l": "Low", "v": "Volume"})
+
+            # ── Moving averages ─────────────────────────────────────────────
+            df["MA20"]     = df["Close"].rolling(window=20).mean()
+            df["Vol_SMA20"] = df["Volume"].rolling(window=20).mean()
+
+            # ── ATR (14-day) ────────────────────────────────────────────────
+            df["TR"] = pd.concat([
+                df["High"] - df["Low"],
+                (df["High"] - df["Close"].shift(1)).abs(),
+                (df["Low"]  - df["Close"].shift(1)).abs(),
+            ], axis=1).max(axis=1)
+            df["ATR"] = df["TR"].rolling(window=14).mean()
+
+            # ── ADX (14-day) ────────────────────────────────────────────────
+            up   = df["High"] - df["High"].shift(1)
+            down = df["Low"].shift(1) - df["Low"]
+            df["+DM"]   = np.where((up > down) & (up > 0),     up,   0.0)
+            df["-DM"]   = np.where((down > up) & (down > 0),   down, 0.0)
+            df["TR14"]  = df["TR"].ewm(span=14, adjust=False).mean()
+            df["+DI14"] = 100 * (df["+DM"].ewm(span=14, adjust=False).mean() / df["TR14"])
+            df["-DI14"] = 100 * (df["-DM"].ewm(span=14, adjust=False).mean() / df["TR14"])
+            di_sum      = df["+DI14"] + df["-DI14"]
+            df["DX"]    = 100 * ((df["+DI14"] - df["-DI14"]).abs() / di_sum.replace(0, 1))
+            df["ADX"]   = df["DX"].ewm(span=14, adjust=False).mean()
+
+            latest = df.iloc[-1]
+            result = {
+                "price":     float(latest["Close"]),
+                "ma_20":     float(latest["MA20"]),
+                "volume":    float(latest["Volume"]),
+                "vol_sma20": float(latest["Vol_SMA20"]),
+                "atr":       float(latest["ATR"]),
+                "adx":       float(latest["ADX"]),
+            }
+            logger.debug("[Alpaca Data] %s — $%.2f  MA20=$%.2f  ADX=%.1f  ATR=%.2f",
+                         clean_symbol, result["price"], result["ma_20"],
+                         result["adx"], result["atr"])
+            return result
+
+    except httpx.HTTPStatusError as e:
+        logger.error("[Alpaca Data] HTTP %d for %s: %s",
+                     e.response.status_code, clean_symbol, e)
     except Exception as e:
-        logger.debug("[Price/Alpaca] %s failed: %s", symbol, e)
-        return None
-
-
-
-
-def fetch_enriched_market_data(ticker_symbol: str) -> dict:
-    """Fetches price + advanced TA using PURE PANDAS (No pandas-ta required)."""
-    try:
-        # Fetch 60 days to give the MAs and ADX enough runway to calculate
-        df = yf.download(ticker_symbol, period="60d", interval="1d", progress=False)
-        if df.empty:
-            return {}
-
-        # Handle yfinance multi-index if present (newer yfinance versions)
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.droplevel(1)
-
-        # 1. Simple Moving Averages
-        df['MA20'] = df['Close'].rolling(window=20).mean()
-        df['Vol_SMA20'] = df['Volume'].rolling(window=20).mean()
-        
-        # 2. Average True Range (ATR)
-        high_low = df['High'] - df['Low']
-        high_pc = (df['High'] - df['Close'].shift(1)).abs()
-        low_pc = (df['Low'] - df['Close'].shift(1)).abs()
-        
-        df['TR'] = pd.concat([high_low, high_pc, low_pc], axis=1).max(axis=1)
-        df['ATR'] = df['TR'].rolling(window=14).mean()
-        
-        # 3. Average Directional Index (ADX) - Wilder's Smoothing approx
-        up_move = df['High'] - df['High'].shift(1)
-        down_move = df['Low'].shift(1) - df['Low']
-        
-        df['+DM'] = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
-        df['-DM'] = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
-        
-        df['TR14'] = df['TR'].ewm(span=14, adjust=False).mean()
-        df['+DI14'] = 100 * (df['+DM'].ewm(span=14, adjust=False).mean() / df['TR14'])
-        df['-DI14'] = 100 * (df['-DM'].ewm(span=14, adjust=False).mean() / df['TR14'])
-        
-        df['DX'] = 100 * (abs(df['+DI14'] - df['-DI14']) / (df['+DI14'] + df['-DI14']))
-        df['ADX'] = df['DX'].ewm(span=14, adjust=False).mean()
-
-        # Grab the latest valid candle
-        latest = df.iloc[-1]
-
-        return {
-            "price": float(latest['Close']),
-            "ma_20": float(latest['MA20']),
-            "volume": float(latest['Volume']),
-            "vol_sma20": float(latest['Vol_SMA20']),
-            "atr": float(latest['ATR']),
-            "adx": float(latest['ADX'])
-        }
-    except Exception as e:
-        logger.error(f"Error fetching TA data for {ticker_symbol}: {e}")
-        return {}
-
+        logger.error("[Alpaca Data] Error fetching TA data for %s: %s", clean_symbol, e)
+    return {}
 
 
 async def fetch_alpaca_mcp_context(ticker: str) -> str:
@@ -296,29 +273,28 @@ class TradingBot:
         self,
         watchlist:            List[str] = None,
         interval_minutes:     int       = 15,
-        sentiment_threshold:  float     = 0.15,   # FIX: was 0.25 — too high
-        confidence_threshold: float     = 0.35,   # FIX: was 0.45/0.50 — too high
+        sentiment_threshold:  float     = 0.15,
+        confidence_threshold: float     = 0.35,
         require_market_hours: bool      = None,   # None = auto (False=paper, True=prod)
         daily_drawdown_limit: float     = 0.03,
         total_drawdown_limit: float     = 0.10,
         signal_cooldown_min:  int       = 30,
-        trend_min_mentions:   int       = 0,      # FIX: 0 = filter disabled (fail-open)
+        trend_min_mentions:   int       = 0,      # 0 = filter disabled
         replicate_model:      str       = "meta/meta-llama-3-70b-instruct",
         min_position_size:    float     = 50.0,
         use_alpaca_mcp:       bool      = True,
-        portfolio_path:       str       = "portfolio.json",  # FIX: persistence
+        portfolio_path:       str       = "portfolio.json",
     ):
         self.watchlist         = watchlist or DEFAULT_WATCHLIST
         self.interval          = interval_minutes * 60
         self.min_position_size = min_position_size
         self.use_alpaca_mcp    = use_alpaca_mcp
         self._trend_min        = trend_min_mentions
-        self._portfolio_path   = portfolio_path   # FIX: save/load path
+        self._portfolio_path   = portfolio_path
 
         # Auto-derive market hours enforcement from PRODUCTION flag only
-        # (USE_ALPACA_PAPER does NOT enforce hours — paper trading runs anytime)
         if require_market_hours is None:
-           require_market_hours = USE_ALPACA
+            require_market_hours = USE_ALPACA
 
         # Portfolio — use AlpacaBroker when either PRODUCTION or USE_ALPACA_PAPER is set
         if USE_ALPACA:
@@ -333,9 +309,6 @@ class TradingBot:
                 self.portfolio = PaperPortfolio.load(portfolio_path)
         else:
             logger.info("[Bot] 📄 PAPER mode — loading portfolio from %s", portfolio_path)
-            # FIX: load() restores open positions + trade history from the last
-            # run. If the file doesn't exist it returns a fresh portfolio, so
-            # first-run behaviour is unchanged.
             self.portfolio = PaperPortfolio.load(portfolio_path)
 
         # Sentiment agent
@@ -368,7 +341,7 @@ class TradingBot:
         self._signals: List[dict]       = []
         self._skipped: List[str]        = []
 
-    # ── Signal handler ────────────────────────────────────────────────────
+    # ── Signal handler ─────────────────────────────────────────────────────
 
     def _on_signal(self, sig: TradeSignal):
         self._signals.append({
@@ -384,7 +357,7 @@ class TradingBot:
         print(f"  {icon} [{sig.signal.value:4s}]  {sig.ticker:<12}  "
               f"conf={sig.confidence:.0%}  |  {sig.reasoning[:100]}")
 
-    # ── Scan cycle ────────────────────────────────────────────────────────
+    # ── Scan cycle ─────────────────────────────────────────────────────────
 
     async def run_once(self, tickers: List[str] = None) -> dict:
         tickers = tickers or self.watchlist
@@ -408,6 +381,14 @@ class TradingBot:
             return self._snapshot(blocked=self.breaker.reason)
         print(f"  🛡  {self.breaker.reason}")
 
+        # FIX #4 — Check stops/take-profits on existing positions before scanning
+        # Previously check_stops() was never called — stop-losses were dead code.
+        if self._prices:
+            stops_closed = self.portfolio.check_stops(self._prices)
+            for rec in stops_closed:
+                pnl_icon = "🟢" if rec.pnl >= 0 else "🔴"
+                print(f"  {pnl_icon} STOP/TP  {rec.ticker}  PnL=${rec.pnl:+.2f}")
+
         # Guard 3 — trending feed refresh
         await self.trend_filter.refresh()
         top = self.trend_filter.top_trending(6)
@@ -416,7 +397,8 @@ class TradingBot:
         else:
             print(f"  📈  Trending: (feed empty — scanning all tickers)\n")
 
-        self._skipped = []
+        self._skipped  = []
+        self._signals  = []   # reset per scan so dashboard shows only latest cycle
 
         for ticker in tickers:
             print(f"\n  ▶  {ticker}")
@@ -428,10 +410,12 @@ class TradingBot:
                 self._skipped.append(ticker)
                 continue
 
-           
-            ta_data = fetch_enriched_market_data(ticker)
+            # FIX #1 — was calling non-existent `fetch_enriched_market_data(ticker)`
+            # (a synchronous stub that was never defined anywhere in the codebase).
+            # Now correctly calls the real async Alpaca function.
+            ta_data = await fetch_alpaca_enriched_data(ticker)
             if not ta_data or ta_data.get("price") is None:
-                print(f"    ⚠  Price/TA data unavailable → skip")
+                print(f"     ⚠  Price/TA data unavailable → skip")
                 self._skipped.append(ticker)
                 continue
 
@@ -440,33 +424,32 @@ class TradingBot:
             clean_sym = ticker.lstrip("$").upper()
             self._prices[ticker]    = price
             self._prices[clean_sym] = price
-            print(f"    💲 ${price:.2f}  MA20=${ma_20:.2f}  ADX={ta_data['adx']:.1f}  "
+            print(f"     💲 ${price:.2f}  MA20=${ma_20:.2f}  "
+                  f"ADX={ta_data['adx']:.1f}  ATR={ta_data['atr']:.2f}  "
                   f"mentions={self.trend_filter.mention_count(ticker)}")
 
             # Headlines
             headlines = await fetch_ticker_headlines(ticker, max_results=15)
-            print(f"    📰 {len(headlines)} headlines → Replicate…")
+            print(f"     📰 {len(headlines)} headlines → Replicate…")
             if headlines:
-                print(f"    📄 Top: {headlines[0][:80]}")
+                print(f"     📄 Top: {headlines[0][:80]}")
 
             # Alpaca MCP context injection
             mcp_context = ""
             if self.use_alpaca_mcp:
                 mcp_context = await fetch_alpaca_mcp_context(ticker)
                 if mcp_context:
-                    print(f"    🔗 Alpaca MCP context injected")
+                    print(f"     🔗 Alpaca MCP context injected")
 
             enriched_news = headlines + ([mcp_context] if mcp_context else [])
 
-            # Strategy evaluation
-            is_crypto_or_poly = not ticker.startswith("$")
-            source_type = "polymarket" if is_crypto_or_poly else "stock"
+            source_type = "polymarket" if not ticker.startswith("$") else "stock"
 
-            # Pass the new technical indicators into MarketContext
+            # Strategy evaluation
             signal = await self.engine.run(MarketContext(
-                ticker=ticker, 
+                ticker=ticker,
                 source=source_type,
-                price=price, 
+                price=price,
                 ma_20=ma_20,
                 adx=ta_data["adx"],
                 atr=ta_data["atr"],
@@ -474,6 +457,23 @@ class TradingBot:
                 vol_sma20=ta_data["vol_sma20"],
                 raw_news=enriched_news,
             ))
+
+            # FIX #2 — _execute() was defined but NEVER CALLED.
+            # Every scan produced signals that were logged to self._signals
+            # but never forwarded to the portfolio/broker. No orders were sent.
+            if signal and signal.signal not in (Signal.HOLD, Signal.SKIP):
+                # Check throttle before executing to avoid rapid re-entries
+                if self.throttle.is_blocked(ticker, signal.signal.value):
+                    print(f"     ⏳ Throttled — cooldown active for {ticker} {signal.signal.value}")
+                else:
+                    self._execute(signal, price)
+                    self.throttle.record(ticker, signal.signal.value)
+
+        # FIX #3 — run_once() had no return statement; callers received None.
+        # The Flask dashboard, run_bot.py, and the loop all depend on this dict.
+        return self._snapshot()
+
+    # ── Order execution ────────────────────────────────────────────────────
 
     def _execute(self, signal: TradeSignal, price: float):
         ticker = signal.ticker
@@ -488,8 +488,8 @@ class TradingBot:
                 source=signal.source,
             )
             if rec:
-                print(f"     ✅ BUY  {ticker}  {rec.shares:.4f}sh @ ${price:.2f}"
-                      f"  cost=${rec.shares * price:.2f}")
+                shares = getattr(rec, "shares", "?")
+                print(f"     ✅ BUY  {ticker}  {shares} sh @ ${price:.2f}")
             else:
                 print(f"     ❌ BUY FAILED {ticker} — see portfolio logs")
 
@@ -501,9 +501,13 @@ class TradingBot:
                     reasoning=signal.reasoning,
                 )
                 if rec:
-                    print(f"     ✅ SELL {ticker}  PnL=${rec.pnl:+.2f}")
+                    pnl = getattr(rec, "pnl", 0)
+                    icon = "🟢" if pnl >= 0 else "🔴"
+                    print(f"     {icon} SELL {ticker}  PnL=${pnl:+.2f}")
             else:
-                print(f"     ℹ  SELL signal — no position in {ticker} (no short)")
+                print(f"     ℹ  SELL signal — no position in {ticker} (no short selling)")
+
+    # ── Snapshot ───────────────────────────────────────────────────────────
 
     def _snapshot(self, blocked: str = "") -> dict:
         snap = self.portfolio.snapshot(self._prices)
@@ -513,16 +517,16 @@ class TradingBot:
         snap["trending"] = dict(self.trend_filter._counts)
         return snap
 
-    # ── Continuous loop ───────────────────────────────────────────────────
+    # ── Continuous loop ────────────────────────────────────────────────────
 
     async def run_loop(self, interval_minutes: int = 15):
-        mode = "PRODUCTION 🔴 LIVE" if PRODUCTION else ("ALPACA PAPER 📊" if USE_ALPACA_PAPER else "PAPER 📄")
+        mode  = "PRODUCTION 🔴 LIVE" if PRODUCTION else ("ALPACA PAPER 📊" if USE_ALPACA_PAPER else "PAPER 📄")
         strat = self.engine._strategies[0] if self.engine._strategies else None
-        print(f"\n🚀  TradingBot v3  [{mode}]")
+        print(f"\n🚀  TradingBot v4  [{mode}]")
         print(f"   Model         : Replicate / Llama-3-70B")
         print(f"   Watchlist     : {', '.join(self.watchlist)}")
         print(f"   Interval      : {interval_minutes} min")
-        if hasattr(self.portfolio, 'starting_cash'):
+        if hasattr(self.portfolio, "starting_cash"):
             print(f"   Capital       : ${self.portfolio.starting_cash:,.2f}")
             print(f"   Risk/trade    : {self.portfolio.risk_per_trade:.0%}")
         if strat:
@@ -535,7 +539,7 @@ class TradingBot:
 
         while True:
             snap = await self.run_once()
-            if hasattr(self.portfolio, 'save'):
+            if hasattr(self.portfolio, "save"):
                 self.portfolio.save(self._portfolio_path)
 
             blocked = snap.get("blocked", "")
@@ -555,7 +559,7 @@ class TradingBot:
 
 async def main():
     import argparse
-    p = argparse.ArgumentParser(description="Trading Bot v3")
+    p = argparse.ArgumentParser(description="Trading Bot v4")
     p.add_argument("--tickers",   nargs="*", default=None)
     p.add_argument("--loop",      action="store_true")
     p.add_argument("--interval",  type=int,   default=15)

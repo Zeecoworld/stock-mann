@@ -65,9 +65,7 @@ class StockSentimentStrategy(BaseStrategy):
                     Signal.BUY, ctx, conf,
                     f"Bullish ({score:+.2f}) + Breakout confirmed! ADX={adx:.1f}, Vol Surge. Dynamic StopLoss: ${stop_loss:.2f}{mcp_tag}"
                 )
-
-            # Fallback if Yahoo Finance fails
-            return self._signal(Signal.BUY, ctx, conf * 0.8, f"Bullish ({score:+.2f}) — no MA data, sentiment-only entry{mcp_tag}")
+            return self._signal(Signal.HOLD, ctx, conf * 0.5, f"Bullish ({score:+.2f}) but no price data — skipping")
 
 
         

@@ -118,10 +118,11 @@ async def get_trending():
 @app.get("/api/trades")
 async def get_trades():
     bot = get_bot()
+    snap = bot.portfolio.snapshot(bot._prices)
     return {
-        "trades":   [t.to_dict() for t in bot.portfolio.trade_log],
-        "win_rate": round(bot.portfolio.win_rate() * 100, 2),
-        "realised_pnl": round(bot.portfolio.realised_pnl(), 2),
+        "trades":       snap.get("recent_trades", []),
+        "win_rate":     snap.get("win_rate", 0.0),
+        "realised_pnl": snap.get("realised_pnl", 0.0),
     }
 
 
