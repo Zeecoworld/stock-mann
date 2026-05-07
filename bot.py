@@ -164,23 +164,42 @@ async def _try_alpaca_price(symbol: str) -> Optional[Dict]:
 
 
 def fetch_enriched_market_data(ticker_symbol: str) -> dict:
-    """Fetches price + advanced TA to prevent whipsaws."""
+    """Fetches price + advanced TA using PURE PANDAS (No pandas-ta required)."""
     try:
         # Fetch 60 days to give the MAs and ADX enough runway to calculate
         df = yf.download(ticker_symbol, period="60d", interval="1d", progress=False)
         if df.empty:
             return {}
 
-        # 1. Moving Averages
-        df['MA20'] = ta.sma(df['Close'], length=20)
-        df['Vol_SMA20'] = ta.sma(df['Volume'], length=20)
+        # Handle yfinance multi-index if present (newer yfinance versions)
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.droplevel(1)
+
+        # 1. Simple Moving Averages
+        df['MA20'] = df['Close'].rolling(window=20).mean()
+        df['Vol_SMA20'] = df['Volume'].rolling(window=20).mean()
         
-        # 2. Average True Range (Volatility)
-        df['ATR'] = ta.atr(df['High'], df['Low'], df['Close'], length=14)
+        # 2. Average True Range (ATR)
+        high_low = df['High'] - df['Low']
+        high_pc = (df['High'] - df['Close'].shift(1)).abs()
+        low_pc = (df['Low'] - df['Close'].shift(1)).abs()
         
-        # 3. Average Directional Index (Trend Strength)
-        adx_df = ta.adx(df['High'], df['Low'], df['Close'], length=14)
-        df['ADX'] = adx_df['ADX_14'] if adx_df is not None else 0.0
+        df['TR'] = pd.concat([high_low, high_pc, low_pc], axis=1).max(axis=1)
+        df['ATR'] = df['TR'].rolling(window=14).mean()
+        
+        # 3. Average Directional Index (ADX) - Wilder's Smoothing approx
+        up_move = df['High'] - df['High'].shift(1)
+        down_move = df['Low'].shift(1) - df['Low']
+        
+        df['+DM'] = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
+        df['-DM'] = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
+        
+        df['TR14'] = df['TR'].ewm(span=14, adjust=False).mean()
+        df['+DI14'] = 100 * (df['+DM'].ewm(span=14, adjust=False).mean() / df['TR14'])
+        df['-DI14'] = 100 * (df['-DM'].ewm(span=14, adjust=False).mean() / df['TR14'])
+        
+        df['DX'] = 100 * (abs(df['+DI14'] - df['-DI14']) / (df['+DI14'] + df['-DI14']))
+        df['ADX'] = df['DX'].ewm(span=14, adjust=False).mean()
 
         # Grab the latest valid candle
         latest = df.iloc[-1]
@@ -198,11 +217,6 @@ def fetch_enriched_market_data(ticker_symbol: str) -> dict:
         return {}
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Alpaca MCP context fetcher
-# Injects live account state into the LLM prompt via alpaca-mcp-server.
-# Install: https://github.com/tedlikeskix/alpaca-mcp-server
-# ─────────────────────────────────────────────────────────────────────────────
 
 async def fetch_alpaca_mcp_context(ticker: str) -> str:
     """
