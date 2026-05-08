@@ -226,7 +226,7 @@ class TradingBot:
 
         self.agent  = SentimentAgent(model=replicate_model)
         self.bus    = SignalBus()
-        self.engine = StrategyEngine(bus=self.bus, sentiment_agent=self.agent)
+        self.engine = StrategyEngine(bus=self.bus, sentiment_agent=None)
         self.engine.register(StockSentimentStrategy(
             sentiment_threshold=sentiment_threshold,
             confidence_threshold=confidence_threshold))

@@ -83,8 +83,8 @@ class BotState:
             "daily_drawdown_limit": 0.03,
             "total_drawdown_limit": 0.10,
             "signal_cooldown_min":  30,
-            "trend_min_mentions":   0,       # was 2 — was silently skipping all tickers
-            "replicate_model":      "meta/meta-llama-3-70b-instruct",
+            "trend_min_mentions":   0,       
+            "replicate_model": "meta/llama-3.3-70b-instruct",
             "use_alpaca_mcp":       True,
         }
 
@@ -205,7 +205,8 @@ class BotState:
             "config":     self.get_config(),
             "portfolio":  portfolio_info,
             "signals":    snap.get("signals", []),
-            "trending":   snap.get("trending", {}),
+            "trending": (dict(self._bot.trend_filter._counts)
+             if self._bot else snap.get("trending", {})),
             "skipped":    snap.get("skipped", []),
             "blocked":    snap.get("blocked", ""),
         }
@@ -371,6 +372,9 @@ def create_app() -> Flask:
     def health():
         return jsonify({"status": "ok", "ts": time.time()})
 
+    if os.getenv("AUTO_START_BOT", "true").lower() == "true":
+        bot_state.start_loop()
+        logger.info("[App] Bot loop auto-started on startup")
     return app
 
 
