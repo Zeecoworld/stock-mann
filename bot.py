@@ -977,13 +977,28 @@ class AlphaSentinel:
                 log.warning(f"[PriceLoop] {e}")
                 await asyncio.sleep(15)
 
+    async def health_server(self):
+        async def handle(reader, writer):
+            try:
+                await reader.read(1024)
+            except Exception:
+                pass
+            writer.write(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK")
+            await writer.drain()
+            writer.close()
+
+        server = await asyncio.start_server(handle, "0.0.0.0", 8080)
+        log.info("[Health] Health check server on port 8080")
+        async with server:
+            await server.serve_forever()
+    
+
     async def run(self):
-        """Bootstrap and run all async tasks."""
-        log.info("[Boot] Starting Alpha Sentinel systems...")
         await asyncio.gather(
             self.broadcast.start(),
             self.trading_loop(),
             self.price_update_loop(),
+            self.health_server(),  
         )
 
 
