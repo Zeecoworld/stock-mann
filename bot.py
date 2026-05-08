@@ -1,11 +1,5 @@
-"""
-╔══════════════════════════════════════════════════════════════╗
-║          ALPHA SENTINEL - Algorithmic Trading Bot            ║
-║          Alpaca API + News Sentiment + Technical Analysis    ║
-║          Author: Alpha Sentinel System v3.1                  ║
-╚══════════════════════════════════════════════════════════════╝
-"""
 
+import http
 import asyncio
 import json
 import logging
@@ -590,13 +584,14 @@ class BroadcastServer:
 
     async def start(self):
         log.info(f"[WS] Dashboard server starting on ws://0.0.0.0:{WS_PORT}")
-        async with websockets.serve(self.register, "0.0.0.0", WS_PORT):
-            await asyncio.Future()  # Run forever
+        async def health_check(connection, request):
+            if request.method in ("HEAD", "GET") and request.headers.get("upgrade", "").lower() != "websocket":
+                return connection.respond(http.HTTPStatus.OK, "OK\n")
+            return None
 
+        async with websockets.serve(self.register, "0.0.0.0", WS_PORT, process_request=health_check):
+            await asyncio.Future()
 
-# ══════════════════════════════════════════════════════════════════════════════
-# ALPHA SENTINEL — Main Trading Bot
-# ══════════════════════════════════════════════════════════════════════════════
 
 class AlphaSentinel:
     def __init__(self):
