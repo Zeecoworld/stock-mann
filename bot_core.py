@@ -24,12 +24,10 @@ import logging
 _log = logging.getLogger(__name__)
 
 try:
-    from bot import TradingBot, DEFAULT_WATCHLIST  # type: ignore
+    from bot import TradingBot, DEFAULT_WATCHLIST 
 
-    # fetch_stock_price was removed in bot.py v4 (yfinance gone).
-    # Provide a no-op shim so any old code that imports it doesn't break.
     try:
-        from bot import fetch_stock_price  # type: ignore
+        from bot import fetch_stock_price 
     except ImportError:
         async def fetch_stock_price(ticker):  # type: ignore
             return None
@@ -37,9 +35,6 @@ try:
     _log.info("[BotCore] bot.py imported successfully → real TradingBot active")
 
 except Exception as exc:
-    # Log the REAL reason so it shows up in Render logs.
-    # Previously this was silently swallowed — developers had no idea why
-    # the stub was active. Now you'll see exactly which dependency is missing.
     import warnings, traceback
     warnings.warn(
         f"bot.py failed to import ({type(exc).__name__}: {exc}) "
@@ -79,7 +74,7 @@ except Exception as exc:
         def position_exists(self, ticker): return False
         def total_value(self, prices): return self.starting_cash
 
-    class TradingBot:   # type: ignore[no-redef]
+    class TradingBot:
         """
         Stub — active only when bot.py fails to import.
         Contains all attributes that app.py accesses so the Flask
@@ -95,7 +90,6 @@ except Exception as exc:
             self.breaker         = _FakeBreaker()
             self.trend_filter    = _FakeTrendFilter()
             self.throttle        = _FakeThrottle()
-            # FIX: _portfolio_path was missing → AttributeError in app.py:143
             self._portfolio_path = kwargs.get("portfolio_path", "portfolio.json")
 
         def _snapshot(self, blocked=""):
@@ -114,7 +108,7 @@ except Exception as exc:
         "$META","$GOOGL","$AMD","$PLTR","$COIN",
     ]
 
-    async def fetch_stock_price(ticker):  # type: ignore
+    async def fetch_stock_price(ticker):
         return None
 
 
